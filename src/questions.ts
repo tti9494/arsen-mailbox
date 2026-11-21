@@ -3,7 +3,8 @@ import { MAX_ROOM_PARTICIPANTS } from "./brand";
 
 type Member = { id: string; name: string; ai_type: string | null };
 export type QuestionTarget = { id: string; step: number | null; direct: boolean };
-const ALL_ADDRESSES = new Set(["전체", "다들", "모두", "전원"]);
+const ALL_ADDRESSES = ["전체", "다들", "모두", "전원"];
+const SHORT_ALL_ADDRESSES = ["비서들", "출첵"];
 
 const TYPE_NAMES: Record<string, string[]> = {
   claude: ["클로드"],
@@ -40,12 +41,22 @@ export function routeQuestion(text: string, members: Member[]): QuestionTarget[]
       for (const label of [member.ai_type, ...(TYPE_NAMES[member.ai_type] ?? [])]) addName(aliases, label, member);
     }
   }
-  const labels = [...new Set([...names.keys(), ...aliases.keys(), ...ALL_ADDRESSES])]
+  const shortAll = new Set(SHORT_ALL_ADDRESSES.filter((label) => !names.has(label) && !aliases.has(label)));
+  const allAddresses = new Set([...ALL_ADDRESSES, ...shortAll]);
+  const labels = [...new Set([...names.keys(), ...aliases.keys(), ...allAddresses])]
     .sort((a, b) => b.length - a.length)
     .map(escapeRegExp);
   const token = `@?(${labels.join("|")})(님(?:에게|한테|께)?|에게|한테|께|아|야|이랑|하고|와|과|랑|도)?(?![\\p{L}\\p{N}_])`;
   const prefix = new RegExp(`^\\s*${token}`, "iu");
-  const first = prefix.exec(text);
+  const matchAddress = (clause: string, first = false) => {
+    const match = prefix.exec(clause);
+    if (!match || !shortAll.has(match[1]) || match[0].trimStart().startsWith("@")) return match;
+    // Bare short calls belong at the start, where they cannot turn "부이, 출첵" into a broadcast.
+    const rest = clause.slice(match[0].length);
+    return first && !match[2] && (/^\s*(?:[,，:：]|→|->|[.!?。！？]*$)/u.test(rest) ||
+      (match[1] === "비서들" && /^\s+출첵[.!?。！？]*$/u.test(rest))) ? match : null;
+  };
+  const first = matchAddress(text, true);
   let terms: string[] = [];
   let ordered = false;
   if (first) {
@@ -55,7 +66,7 @@ export function routeQuestion(text: string, members: Member[]): QuestionTarget[]
     while (rest) {
       const separator = /^\s*(→|->|[,，])\s*/u.exec(rest);
       const remaining = separator ? rest.slice(separator[0].length) : rest;
-      const next = prefix.exec(remaining);
+      const next = matchAddress(remaining);
       if (!next || (!separator && !rest.trimStart().startsWith("@") && !/^(?:이랑|하고|와|과|랑)$/u.test(particle ?? ""))) {
         if (separator && /→|->/.test(separator[1])) throw new Refused("question_ambiguous");
         break;
@@ -74,10 +85,10 @@ export function routeQuestion(text: string, members: Member[]): QuestionTarget[]
   } else {
     if (/^\s*@/u.test(text)) throw new Refused("question_ambiguous");
     const matches = text.matchAll(new RegExp(`(?:^|[^\\p{L}\\p{N}_])${token}`, "giu"));
-    terms = [...matches].filter((match) => !ALL_ADDRESSES.has(normalize(match[1])) || match[0].includes("@"))
+    terms = [...matches].filter((match) => !allAddresses.has(normalize(match[1])) || match[0].includes("@"))
       .map((match) => match[1]);
   }
-  if (terms.some((term) => ALL_ADDRESSES.has(normalize(term)))) {
+  if (terms.some((term) => allAddresses.has(normalize(term)))) {
     if (ordered) throw new Refused("question_ambiguous");
     return members.map(({ id }) => ({ id, step: null, direct: false }));
   }
