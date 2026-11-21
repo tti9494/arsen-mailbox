@@ -6,7 +6,7 @@ import { LIMITS } from "../src/policy";
 import { SIGNUP_WRITE_WEIGHT, SLOW_READS, DEFAULT_SPACE_DAILY_WRITE_LIMIT, STOP_MUTATIONS, STOP_TRAFFIC } from "../src/budget";
 import { SPACE_LIMITS } from "../src/brand";
 import { migrateOwnerRows } from "../src/migrate-owner-rows";
-import type { QuestionState, RelayTurn } from "../src/questions";
+import { routeQuestion, type QuestionState, type RelayTurn } from "../src/questions";
 
 const local = {
   ...env,
@@ -1317,9 +1317,28 @@ describe("v2.2 scoped conversations", () => {
   const pathOf = (id: string) => "/api/rooms/" + id;
   const patchMe = (key: string, body: unknown) => call("/api/me", "PATCH", key, body);
 
+  it("requires a clear group call for 비서들 and 출첵 while preserving leading names and aliases", () => {
+    const vooy = { id: "1", name: "부이1", ai_type: "vooy" };
+    const pickle = { id: "2", name: "피클", ai_type: "pickle" };
+    const members = [vooy, pickle];
+    const all = members.map(({ id }) => ({ id, step: null, direct: false }));
+    for (const text of ["비서들, 한 줄씩 알려주세요", "비서들 출첵", "출첵!", "출첵: 확인 부탁해요", "이 방의 @비서들 확인 부탁해요"]) {
+      expect(routeQuestion(text, members), text).toEqual(all);
+    }
+    for (const text of ["내 비서들", "오늘은 비서들 이야기를 나눴어요", "비서들 모임은 내일입니다", "출첵 결과를 정리했어요"]) {
+      expect(routeQuestion(text, members), text).toEqual([]);
+    }
+    const direct = [{ id: vooy.id, step: null, direct: true }];
+    for (const text of ["부이, 출첵", "브이, 비서들 이야기를 정리해 주세요", "부이1, 오늘은 @비서들 이야기를 정리해 주세요"]) {
+      expect(routeQuestion(text, members), text).toEqual(direct);
+    }
+    expect(routeQuestion("비서들: 확인", [{ ...vooy, name: "비서들" }, pickle])).toEqual(direct);
+    expect(routeQuestion("출첵: 확인", [{ ...vooy, name: "출첵1" }, pickle])).toEqual(direct);
+  });
+
   it("routes group calls only to active assistants and leaves ordinary posts unassigned", async () => {
     const owner = await ok(signup());
-    const r = await room(owner.key);
+    const r = await ok(call("/api/rooms", "POST", owner.key, { name: "내 비서들" }));
     const other = await room(owner.key);
     const p = pathOf(r.room_id);
     const auto = await member(r.room_id, owner.key, "업무 비서");
@@ -1332,12 +1351,17 @@ describe("v2.2 scoped conversations", () => {
     await member(other.room_id, owner.key, "다른 방 비서");
     const post = (text: string) => ok(call(p + "/messages", "POST", owner.key, { text }));
     const all = await post("다들 출첵");
+    const shortAll = await post("비서들 출첵");
+    const roomName = await post("내 비서들");
     const direct = await post("업무 비서: 한 줄로 알려주세요");
     const plain = await post("오늘 일정은 다들 공유했습니다.");
     const read = async () => (await ok(call(p + "/messages?since=0", "GET", owner.key))).questions;
     const states = await read();
-    expect(states.filter((q) => q.question_id === all.id).map((q) => [q.participant_id, q.direct]))
-      .toEqual([[auto.participant_id, 0], [manual.participant_id, 0]]);
+    for (const group of [all, shortAll]) {
+      expect(states.filter((q) => q.question_id === group.id).map((q) => [q.participant_id, q.direct]))
+        .toEqual([[auto.participant_id, 0], [manual.participant_id, 0]]);
+    }
+    expect(states.filter((q) => q.question_id === roomName.id)).toEqual([]);
     expect(states.filter((q) => q.question_id === direct.id).map((q) => [q.participant_id, q.direct]))
       .toEqual([[auto.participant_id, 1]]);
     expect(states.filter((q) => q.question_id === plain.id)).toEqual([]);
