@@ -1,4 +1,4 @@
-// Run from mailbox-worker. All account data and the migration output live in a fresh private temp directory.
+// Run from the repository root. All account data and the migration output live in a fresh private temp directory.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
