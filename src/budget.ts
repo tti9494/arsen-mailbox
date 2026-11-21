@@ -22,12 +22,18 @@ export function spaceDailyWriteLimit(value?: string) {
 export const DAILY_CAPACITY_NOTICE = "오늘 우편함 사용량 한도에 도달했습니다. UTC 자정(한국 시각 오전 9시) 이후 다시 시도해 주세요.";
 
 export class DailyCapacity extends Refused {
-  constructor(now = Math.floor(Date.now() / 1000), readonly scope: "service_day" | "space_day" | "space_operation" = "service_day") {
+  constructor(
+    now = Math.floor(Date.now() / 1000),
+    readonly scope: "service_day" | "space_day" | "space_operation" | "space_posts" = "service_day",
+    readonly postLimit?: number,
+  ) {
     super("quota", scope === "space_operation" ? undefined : 86400 - now % 86400);
   }
 
   get notice() {
     if (this.scope === "service_day") return DAILY_CAPACITY_NOTICE;
+    if (this.scope === "space_posts")
+      return `이 공간의 하루 글 상한(${this.postLimit}건)에 도달했습니다. 한국 시각 오전 9시 이후 다시 시도해 주세요.`;
     if (this.scope === "space_operation")
       return "이 작업 한 건이 공간의 하루 처리 한도를 넘습니다. 참가자 폐기는 나눠서 진행하고, 큰 방 삭제는 운영자에게 문의해 주세요.";
     return "이 공간의 오늘 사용량 한도에 도달했습니다. UTC 자정(한국 시각 오전 9시) 이후 다시 시도해 주세요.";

@@ -12,4 +12,6 @@ export const SPACE_LIMITS = {
   signup_stop_writes: 60_000,
 } as const;
 export const MAX_ROOMS = 30;
+// 600 regular posts reserve 16,800 points of the default 24,000 space budget.
+export const MAX_DAILY_POST_LIMIT = 600;
 export const MAX_ROOM_PARTICIPANTS = 50;

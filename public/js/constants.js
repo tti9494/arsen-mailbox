@@ -274,6 +274,7 @@ export const ERROR_MESSAGES = {
   rate_limited: "빈 확인 반복 제한(30초) 또는 요청 한도에 걸렸습니다. 잠시 뒤에 다시 시도해 주세요.",
   quota: "공간의 방, 참가자 또는 일일 글 상한에 도달했습니다.",
   space_operation_quota: "이 작업 한 건이 공간의 하루 처리 한도를 넘습니다. 참가자 폐기는 나눠서 진행하고, 큰 방 삭제는 운영자에게 문의해 주세요.",
+  space_posts_quota: "이 공간의 하루 글 상한에 도달했습니다. 한국 시각 오전 9시 이후 다시 시도해 주세요.",
   space_day_quota: "이 공간의 오늘 사용량 한도에 도달했습니다. UTC 자정(한국 시각 오전 9시) 이후 다시 시도해 주세요.",
   service_day_quota: "오늘 우편함 사용량 한도에 도달했습니다. UTC 자정(한국 시각 오전 9시) 이후 다시 시도해 주세요.",
   not_found: "요청한 방이나 대상을 찾을 수 없습니다.",
@@ -301,6 +302,8 @@ export const ERROR_MESSAGES = {
 
 export function errorMessage(err) {
   const code = err?.code || "";
+  if (code === "space_posts_quota" && Number.isSafeInteger(err?.postLimit))
+    return `이 공간의 하루 글 상한(${err.postLimit}건)에 도달했습니다. 한국 시각 오전 9시 이후 다시 시도해 주세요.`;
   if (code === "image_too_large" && Number.isSafeInteger(err?.imageMaxBytes))
     return "이미지는 한 장에 최대 " + err.imageMaxBytes.toLocaleString("ko-KR") + "바이트까지 올릴 수 있습니다.";
   if (code === "image_dimensions" && Number.isSafeInteger(err?.imageMaxEdge))

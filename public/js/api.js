@@ -112,7 +112,7 @@ export async function apiRequest(
       ? res.status === 401
         ? "unauthorized"
         : "forbidden"
-      : data?.error === "quota" && ["service_day", "space_day", "space_operation"].includes(data.scope)
+      : data?.error === "quota" && ["service_day", "space_day", "space_operation", "space_posts"].includes(data.scope)
         ? data.scope + "_quota"
       : ["quota", "rate_limited"].includes(data?.error) && imageScopes.includes(data.scope)
         ? "image_" + data.scope
@@ -130,6 +130,7 @@ export async function apiRequest(
     const error = new ApiError(code, res.status, retryAfter, statusDefinitive);
     if (Number.isSafeInteger(data?.image_max_bytes) && data.image_max_bytes > 0) error.imageMaxBytes = data.image_max_bytes;
     if (Number.isSafeInteger(data?.image_max_edge) && data.image_max_edge > 0) error.imageMaxEdge = data.image_max_edge;
+    if (code === "space_posts_quota" && Number.isSafeInteger(data.limit) && data.limit > 0) error.postLimit = data.limit;
     throw error;
   }
 

@@ -4,7 +4,7 @@ import worker, { newKey, purge, sourceOf, sha256hex, type Env } from "../src/app
 import { dayStart, readWriteEstimate } from "../src/budget";
 import { LIMITS } from "../src/policy";
 import { SIGNUP_WRITE_WEIGHT, SLOW_READS, DEFAULT_SPACE_DAILY_WRITE_LIMIT, STOP_MUTATIONS, STOP_TRAFFIC } from "../src/budget";
-import { SPACE_LIMITS } from "../src/brand";
+import { MAX_DAILY_POST_LIMIT, SPACE_LIMITS } from "../src/brand";
 import { migrateOwnerRows } from "../src/migrate-owner-rows";
 import { routeQuestion, type QuestionState, type RelayTurn } from "../src/questions";
 
@@ -1435,6 +1435,95 @@ describe("v2.2 scoped conversations", () => {
     await denied(call(p, "POST", owner.key, { name: "추가 불가", kind: "human" }), 429, "quota");
     expect(await ok(patchMe(owner.key, { room_limit: 30, participant_limit: 50 })))
       .toMatchObject({ room_limit: 30, participant_limit: 50, retention_days: 30 });
+  });
+
+  it("lets only the owner set a daily post limit and enforces it across concurrent senders", async () => {
+    const owner = await ok(signup());
+    const r = await room(owner.key);
+    const assistant = await member(r.room_id, owner.key);
+    const path = pathOf(r.room_id) + "/messages";
+    const me = () => ok(call("/api/me", "GET", owner.key));
+    expect(await me()).toMatchObject({ daily_post_limit: 500, limits: { messages_per_day: 500, max_messages_per_day: 600 } });
+    for (const daily_post_limit of [-1, 0, 1.5, 601, "600", null]) {
+      await denied(patchMe(owner.key, { daily_post_limit }), 400, "invalid");
+    }
+    await denied(patchMe(assistant.key, { daily_post_limit: 600 }), 403, "forbidden");
+    await denied(patchMe("", { daily_post_limit: 600 }), 401, "unauthorized");
+    expect(await me()).toMatchObject({ daily_post_limit: 500 });
+    expect(await ok(patchMe(owner.key, { daily_post_limit: 600 }))).toMatchObject({ daily_post_limit: 600 });
+    expect(await me()).toMatchObject({ limits: { messages_per_day: 600 } });
+    await db.prepare("INSERT INTO rate_hits VALUES('space_posts',?,?,500)").bind(owner.space_id, dayStart()).run();
+    await ok(call(path, "POST", owner.key, { text: "기본 상한을 넘긴 글" }));
+    await db.prepare("UPDATE rate_hits SET count=599 WHERE bucket='space_posts' AND subject=?")
+      .bind(owner.space_id).run();
+    const posts = await Promise.all([
+      call(path, "POST", owner.key, { text: "마지막 글" }),
+      call(`/r/${r.room_id}/send`, "POST", assistant.key, { text: "경계 검사" }),
+    ]);
+    expect(posts.map((response) => response.status).sort()).toEqual([200, 429]);
+    const rejected = posts.find((response) => response.status === 429)!;
+    const limit = await rejected.json();
+    expect(limit).toMatchObject({ error: "quota", scope: "space_posts", limit: 600,
+      message: expect.stringContaining("600건") });
+    expect(Number(rejected.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(await me()).toMatchObject({ usage: { messages_today: 600 } });
+    expect(await ok(patchMe(owner.key, { daily_post_limit: 550 }))).toMatchObject({ daily_post_limit: 550 });
+    const lowered = await call(path, "POST", owner.key, { text: "하향 이후 글" });
+    expect(lowered.status).toBe(429);
+    expect(await lowered.json()).toMatchObject({ limit: 550, message: expect.stringContaining("550건") });
+    expect(await me()).toMatchObject({ usage: { messages_today: 600 }, limits: { messages_per_day: 550 } });
+    const address = await member(r.room_id, owner.key, "주소 비서", "assistant", "get");
+    const read = await call(`/r/${r.room_id}/read?k=${address.key}`);
+    expect(read.status).toBe(200);
+    const ticket = /^# 보내기 확인값: (amt_v2_[\w-]+)$/m.exec(await read.text())?.[1];
+    expect(ticket).toBeTruthy();
+    const query = new URLSearchParams({ k: address.key, c: ticket!, text: "주소 방식 한도" });
+    const addressSend = await call(`/r/${r.room_id}/send?${query}`);
+    expect(addressSend.status).toBe(429);
+    expect(await addressSend.text()).toMatch(/^error: quota\n.*550건/m);
+  });
+
+  it("keeps raised post limits inside the existing space and service write budgets", async () => {
+    const owner = await ok(signup()), other = await ok(signup());
+    const r = await room(owner.key), otherRoom = await room(other.key);
+    const assistant = await member(r.room_id, owner.key, "검증 비서");
+    await ok(patchMe(owner.key, { daily_post_limit: MAX_DAILY_POST_LIMIT }));
+    const day = dayStart(), now = day + 64_801;
+    vi.spyOn(Date, "now").mockReturnValue(now * 1000);
+    const setPoints = (points: number) => db.prepare("UPDATE spaces SET request_day=?,request_write_estimate=? WHERE id=?")
+      .bind(day, points, owner.space_id).run();
+    const post = (text: string, SPACE_DAILY_WRITE_LIMIT?: string) => call(pathOf(r.room_id) + "/messages", "POST", owner.key,
+      { text }, { ...local, SPACE_DAILY_WRITE_LIMIT });
+    await setPoints(972);
+    const question = await post("검증 비서: 질문 예약점", "1000");
+    expect(question.status).toBe(429);
+    expect(await question.json()).toMatchObject({ error: "quota", scope: "space_day" });
+    await ok(post("같은 예산에서 일반 글", "1000"));
+    for (const [allocation, setting] of [[DEFAULT_SPACE_DAILY_WRITE_LIMIT, undefined], [30_000, "40000"]] as const) {
+      await setPoints(allocation - 28);
+      await ok(post(`공간 예산 마지막 글 ${allocation}`, setting));
+      const limited = await post("공간 예산 초과 글", setting);
+      expect(limited.status).toBe(429);
+      expect(await limited.json()).toMatchObject({ error: "quota", scope: "space_day" });
+      expect(await db.prepare("SELECT request_write_estimate FROM spaces WHERE id=?").bind(owner.space_id)
+        .first("request_write_estimate")).toBe(allocation);
+    }
+    await ok(call(pathOf(otherRoom.room_id) + "/messages", "POST", other.key, { text: "다른 공간의 글" }));
+    await setPoints(0);
+    await db.prepare("INSERT INTO rate_hits VALUES('send',?,?,?) ON CONFLICT DO UPDATE SET count=excluded.count")
+      .bind(r.owner_participant_id, now - now % 60, LIMITS.send[0]).run();
+    await denied(post("참가자 분당 한도 확인"), 429, "rate_limited");
+    await db.prepare("DELETE FROM rate_hits WHERE bucket='send' AND subject=?").bind(r.owner_participant_id).run();
+    await db.prepare("INSERT INTO rate_hits VALUES('send_day',?,?,?)")
+      .bind(assistant.participant_id, day, LIMITS.send_day[0]).run();
+    await denied(call(`/r/${r.room_id}/send`, "POST", assistant.key, { text: "참가자 일일 한도 확인" }), 429, "rate_limited");
+    const increase = STOP_MUTATIONS - 27 - await readWriteEstimate(db, day);
+    await db.prepare("INSERT INTO rate_hits VALUES('estimated_writes','all',?,?) ON CONFLICT DO UPDATE SET count=count+excluded.count")
+      .bind(day, increase).run();
+    const service = await post("서비스 예산 확인");
+    expect(service.status).toBe(429);
+    expect(await service.json()).toMatchObject({ error: "quota", scope: "service_day" });
+    expect(await readWriteEstimate(db, day)).toBe(STOP_MUTATIONS - 27);
   });
 
   it("applies each retention policy in reads, replies, exports, and cron while preserving explicit deletion", async () => {

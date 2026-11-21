@@ -169,7 +169,7 @@ function retry(e: Refused) {
 export function dailyCapacityResponse(reason: DailyCapacity, asPlain = false) {
   const response = asPlain
     ? plain("error: quota\n" + reason.notice + "\n", 429)
-    : json({ error: "quota", scope: reason.scope, message: reason.notice, retry_after: reason.retryAfter }, 429);
+    : json({ error: "quota", scope: reason.scope, message: reason.notice, retry_after: reason.retryAfter, limit: reason.postLimit }, 429);
   if (reason.retryAfter !== undefined) response.headers.set("retry-after", String(reason.retryAfter));
   return response;
 }
@@ -748,7 +748,9 @@ export async function sendMessage(
   const { guards: statements, updates } = sendAdmission(env, who, now, day, sendCost);
   if (who.space_id) {
     statements.push(retentionGuard(env.DB, who.space_id, who.retention_days, who.retention_rev));
-    statements.push(requireSql(env.DB, "quota", dayCount + "<?", "space_posts", who.space_id, day, SPACE_LIMITS.messages_per_day));
+    statements.push(env.DB.prepare("INSERT INTO space_post_assertion(failure) SELECT 'quota' WHERE " +
+      dayCount + ">=(SELECT daily_post_limit FROM spaces WHERE id=?)")
+      .bind("space_posts", who.space_id, day, who.space_id));
   }
   if (relayedFor !== null) {
     statements.push(requireSql(env.DB, "not_found",
@@ -782,6 +784,11 @@ export async function sendMessage(
   let result;
   try { result = await env.DB.batch<{ id: number }>(statements); }
   catch (e) {
+    if (who.space_id && String(e).includes("CHECK constraint failed: space_post_quota")) {
+      const limit = await env.DB.prepare("SELECT daily_post_limit FROM spaces WHERE id=?")
+        .bind(who.space_id).first<number>("daily_post_limit");
+      throw new DailyCapacity(now, "space_posts", limit ?? SPACE_LIMITS.messages_per_day);
+    }
     const reason = imageLimit(e) ?? refusal(e);
     if (reason?.code === "not_found") return refuseSendAttempt(env, who, reason);
     throw reason ?? e;

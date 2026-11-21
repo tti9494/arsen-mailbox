@@ -23,7 +23,7 @@ import {
   type Env,
   type Participant,
 } from "./app";
-import { MAX_ROOM_PARTICIPANTS, MAX_ROOMS, SPACE_LIMITS } from "./brand";
+import { MAX_DAILY_POST_LIMIT, MAX_ROOM_PARTICIPANTS, MAX_ROOMS, SPACE_LIMITS } from "./brand";
 import {
   capStage, DailyCapacity, dayCount, dayStart, estimateBindings, estimatedWrites, roomDeletionCost,
   spaceDailyWriteLimit, spaceRevocationCost, STOP_MUTATIONS, STOP_TRAFFIC, type WriteCost,
@@ -239,7 +239,7 @@ async function mySpace(env: Env, space: Space, action: string, method: string, b
     const [, info, usage] = await db.batch<Record<string, unknown>>([
       guard,
       db.prepare("SELECT id AS space_id,plan,status,created_at,last_seen_at,room_limit,participant_limit,retention_days," +
-        "retention_rev AS retention_revision,assistant_defaults FROM spaces WHERE id=?").bind(id),
+        "daily_post_limit,retention_rev AS retention_revision,assistant_defaults FROM spaces WHERE id=?").bind(id),
       db
         .prepare("SELECT (SELECT COUNT(*) FROM rooms WHERE owner_id=?) AS rooms," + dayCount + " AS messages_today," +
           estimatedWrites + " AS service_write_estimate," + imageUsageSql)
@@ -251,6 +251,7 @@ async function mySpace(env: Env, space: Space, action: string, method: string, b
     const estimate = Number(service_write_estimate);
     return json({ ...row, assistant_defaults: JSON.parse(assistant_defaults as string), limits: {
       ...SPACE_LIMITS, ...imageUsageLimits(env), rooms: row.room_limit, participants: row.participant_limit, retention_days: row.retention_days,
+      messages_per_day: row.daily_post_limit, max_messages_per_day: MAX_DAILY_POST_LIMIT,
       max_rooms: MAX_ROOMS, max_participants: MAX_ROOM_PARTICIPANTS,
       space_daily_write_limit: space.allocation, space_requests_per_day: LIMITS.space_day[0],
     }, image_uploads: imageUploadsOn(env.IMAGE_UPLOADS), usage: { ...spaceUsage, service_capacity: {
@@ -265,17 +266,19 @@ async function mySpace(env: Env, space: Space, action: string, method: string, b
     };
     const rooms = limit(body.room_limit, MAX_ROOMS);
     const people = limit(body.participant_limit, MAX_ROOM_PARTICIPANTS);
+    const posts = limit(body.daily_post_limit, MAX_DAILY_POST_LIMIT);
     const days = body.retention_days;
     if (days !== undefined && days !== null && days !== 7 && days !== 30 && days !== 90) throw new Refused("invalid");
-    if (rooms === null && people === null && days === undefined) throw new Refused("invalid");
+    if (rooms === null && people === null && posts === null && days === undefined) throw new Refused("invalid");
     const [, updated] = await db.batch([
       guard,
       db.prepare("UPDATE spaces SET room_limit=COALESCE(?1,room_limit),participant_limit=COALESCE(?2,participant_limit)," +
+        " daily_post_limit=COALESCE(?7,daily_post_limit)," +
         " retention_rev=CASE WHEN ?3=1 AND retention_days IS NOT ?4 THEN retention_rev+1 ELSE retention_rev END," +
         " retention_days=CASE WHEN ?3=1 THEN ?4 ELSE retention_days END WHERE id=?5" +
         " AND (?3=0 OR ?6=1 OR COALESCE(?4,91)>=COALESCE(retention_days,91))" +
-        " RETURNING room_limit,participant_limit,retention_days,retention_rev AS retention_revision",
-      ).bind(rooms, people, days === undefined ? 0 : 1, days ?? null, id, body.confirm === "보관 기간 단축" ? 1 : 0),
+        " RETURNING room_limit,participant_limit,daily_post_limit,retention_days,retention_rev AS retention_revision",
+      ).bind(rooms, people, days === undefined ? 0 : 1, days ?? null, id, body.confirm === "보관 기간 단축" ? 1 : 0, posts),
     ]);
     if (!updated.results.length) throw new Refused("invalid");
     return json(updated.results[0]);

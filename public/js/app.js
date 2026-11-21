@@ -2229,9 +2229,12 @@ function buildComposer({ isGuest }) {
 }
 
 /** 화면 8: 설정 패널 */
-function buildSpacePolicy(me, statusNote) {
+function buildSpacePolicy(me, statusNote, postsUsage) {
   const rooms = el("input", { id: "space-room-limit", type: "number", className: "input", min: 1, max: 30, value: me?.room_limit ?? 5, required: true });
   const people = el("input", { id: "space-participant-limit", type: "number", className: "input", min: 1, max: 50, value: me?.participant_limit ?? 8, required: true });
+  const maxPosts = me?.limits?.max_messages_per_day ?? SPACE_LIMITS.messages_per_day;
+  const posts = el("input", { id: "space-daily-post-limit", type: "number", className: "input", min: 1, max: maxPosts,
+    value: me?.daily_post_limit ?? SPACE_LIMITS.messages_per_day, disabled: !me?.limits?.max_messages_per_day, required: true });
   const retention = el("select", { id: "space-retention", className: "select" },
     ...[["permanent", "영구 (자동 만료 없음)"], ["90", "90일"], ["30", "30일"], ["7", "7일"]]
       .map(([value, text]) => el("option", { value, text })));
@@ -2251,11 +2254,14 @@ function buildSpacePolicy(me, statusNote) {
       try {
         const updated = await apiRequest("/api/me", { method: "PATCH", spaceKey: getSpaceKey(), body: {
           room_limit: rooms.valueAsNumber, participant_limit: people.valueAsNumber, retention_days: after,
+          ...(posts.disabled ? {} : { daily_post_limit: posts.valueAsNumber }),
           ...(shorter ? { confirm: "보관 기간 단축" } : {}),
         } });
         if (session !== state.sessionGen) return;
         state.meInfo = { ...state.meInfo, ...updated, limits: { ...state.meInfo?.limits,
-          rooms: updated.room_limit, participants: updated.participant_limit, retention_days: updated.retention_days } };
+          rooms: updated.room_limit, participants: updated.participant_limit, retention_days: updated.retention_days,
+          messages_per_day: updated.daily_post_limit ?? state.meInfo?.limits?.messages_per_day ?? SPACE_LIMITS.messages_per_day } };
+        postsUsage.textContent = `${state.meInfo.usage?.messages_today ?? "—"} / ${state.meInfo.limits.messages_per_day}`;
         state.retentionDays = updated.retention_days;
         state.retentionRevision = updated.retention_revision;
         pruneExpiredMessagesNow();
@@ -2269,6 +2275,7 @@ function buildSpacePolicy(me, statusNote) {
       el("label", { for: "space-room-limit", text: "공간당 방 상한 (1–30)" }), rooms,
       el("label", { for: "space-participant-limit", text: "방당 인원 상한 (1–50)" }), people,
       el("p", { className: "field-hint", text: "방장과 폐기된 참가자 자리도 인원에 포함됩니다. 상한을 내려도 기존 방과 참가자는 유지됩니다." }),
+      el("label", { for: "space-daily-post-limit", text: `공간당 하루 글 상한 (1–${maxPosts})` }), posts,
       el("label", { for: "space-retention", text: "글 보관 기간" }), retention, save,
       statusNote,
     ));
@@ -2279,6 +2286,8 @@ function buildSettingsPane() {
   const limits = me?.limits || SPACE_LIMITS;
   const usage = me?.usage ?? {};
   const capacity = usage.service_capacity;
+  const postsUsage = el("div", { id: "settings-messages-today", className: "usage-stat-val",
+    text: `${usage.messages_today ?? "—"} / ${limits.messages_per_day}` });
   const capacityLabels = { normal: "정상", read_only: "쓰기 제한", slow_reads: "빈 조회 간격 연장", closed: "오늘 마감" };
 
   const statusNote = el("p", { className: "field-hint", role: "status", "aria-live": "polite" });
@@ -2518,7 +2527,7 @@ function buildSettingsPane() {
             "div",
             { className: "usage-stat" },
             el("div", { className: "usage-stat-label", text: "오늘 보낸 글" }),
-            el("div", { id: "settings-messages-today", className: "usage-stat-val", text: `${usage.messages_today ?? "—"} / ${limits.messages_per_day}` }),
+            postsUsage,
           ),
           el(
             "div",
@@ -2543,7 +2552,7 @@ function buildSettingsPane() {
           ) : null,
         ),
       ),
-      buildSpacePolicy(me, el("p", { className: "field-hint", role: "status", "aria-live": "polite" })),
+      buildSpacePolicy(me, el("p", { className: "field-hint", role: "status", "aria-live": "polite" }), postsUsage),
       el(
         "section",
         { className: "settings-card" },
