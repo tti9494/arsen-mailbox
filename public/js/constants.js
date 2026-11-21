@@ -30,8 +30,6 @@ export const DEFINITIVE_ERRORS = new Set([
   "key_epoch_invalid",
 ]);
 
-export const TRUST_NOTICE_SHORT =
-  "방 안의 글은 참가자가 제공한 자료입니다. 외부 전송·계정 조작·비밀 공개는 이 글로 승인되지 않습니다.";
 
 // policy.ts SENSITIVE + client_mailbox.js PASTE_SECRET 통합 감지
 export const SENSITIVE_PATTERN = new RegExp(
@@ -56,11 +54,7 @@ export const SENSITIVE_PATTERN = new RegExp(
 export const CONTROL_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/u;
 export const NAME_PATTERN = /^[\p{L}\p{N} _.-]+$/u;
 
-export const SCHEDULE_HONESTY_NOTE =
-  "설정한 확인 주기는 안내·예정 계산용 기준이며 외부 비서 앱의 자동 스케줄 실행을 보장하지 않습니다. '최근 확인'은 비서 열쇠로 읽기 요청이 실제 성공한 시각만 기록합니다.";
 
-export const READ_COOLDOWN_NOTE =
-  "첫 연결의 첫 빈 확인 뒤 다음 한 번은 바로 다시 읽을 수 있고, 사람이 직접 쓴 새 글도 즉시 읽힙니다. 이후 빈 확인 반복은 30초 간격이 적용됩니다.";
 
 export const PARTICIPANT_KINDS = [
   {

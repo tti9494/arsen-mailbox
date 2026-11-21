@@ -128,8 +128,8 @@ export function getChatPreferences() {
 
 function shortcutHintTextFor(sendKey) {
   return sendKey === "ctrl_enter"
-    ? "Ctrl+Enter(⌘+Enter) 보내기 · Enter 줄바꿈 (모바일은 보내기 버튼)"
-    : "Enter 보내기 · Shift+Enter 줄바꿈 (모바일은 보내기 버튼)";
+    ? "Ctrl+Enter 전송 · Enter 줄바꿈"
+    : "Enter 전송 · Shift+Enter 줄바꿈";
 }
 
 function syncComposerHintInDom(sendKey) {
@@ -895,12 +895,6 @@ export function openChatSettings(
             },
           ),
           el("div", { className: "chat-rename-row" }, renameInput, renameBtn),
-          el("span", {
-            className: "field-hint",
-            text: canManageOwnerName
-              ? "이 방의 대화와 참가자 목록에 표시되는 이름입니다 (32자 이내)."
-              : "닉네임을 바꿀 방을 먼저 열어 주세요.",
-          }),
           renameStatus,
         );
 
@@ -958,10 +952,6 @@ export function openChatSettings(
             { className: "chat-settings-section-head" },
             el("h3", { className: "chat-settings-section-title", text: "대화 내보내기" }),
           ),
-          el("p", {
-            className: "field-hint",
-            text: "현재 방에서 열람 가능한 보관 기간 내 대화를 원하는 파일 형식으로 내려받습니다.",
-          }),
           exportGrid,
           exportStatus,
         );
@@ -1070,10 +1060,6 @@ export function openChatSettings(
             { className: "chat-settings-section-head" },
             el("h3", { className: "chat-settings-section-title", text: "대화창 스킨 (5종)" }),
           ),
-          el("p", {
-            className: "field-hint",
-            text: "스킨과 아래 화면 밝기는 서로 독립적으로 조합되어 이 브라우저에 기억됩니다.",
-          }),
           skinGrid,
         ),
         el(
@@ -1114,10 +1100,6 @@ export function openChatSettings(
             el("h3", { className: "chat-settings-section-title", text: "메시지 전송 키" }),
           ),
           sendKeyGrid,
-          el("p", {
-            className: "field-hint",
-            text: "한글·일본어·중국어 입력기(IME) 조합 중에는 Enter를 눌러도 조합이 깨지거나 먼저 전송되지 않습니다.",
-          }),
         ),
         el(
           "section",
@@ -1138,7 +1120,7 @@ export function openChatSettings(
             "label",
             { className: "check-row" },
             browserNotifyToggle,
-            el("span", { text: "백그라운드 브라우저 알림 표시 (켤 때만 권한 요청)" }),
+            el("span", { text: "브라우저 알림" }),
           ),
           notifyStatus,
         ),
