@@ -1,5 +1,5 @@
 import { DailyCapacity, dayStart, readWriteEstimate, reserveBulk, roomDeletionCost } from "./budget";
-import { SECONDS_PER_DAY } from "./retention";
+import { CLOSED_ROOM_OWNER, SECONDS_PER_DAY } from "./retention";
 import { refusal } from "./transaction";
 
 const PAGE = 120;
@@ -8,7 +8,8 @@ const SPACE_SCAN = 32;
 const CRON_CEILING = 45_000;
 const joins = " FROM messages m JOIN rooms r ON r.id=m.room_id LEFT JOIN spaces s ON s.id=r.owner_id";
 const deadSpace = "s.status='deleted' AND s.deleted_at<=?1-86400";
-const expired = "(" + deadSpace +
+const discarded = "(" + deadSpace + " OR r.owner_id='" + CLOSED_ROOM_OWNER + "')";
+const expired = "(" + discarded +
   " OR (m.created_at<=?1-7*86400 AND m.created_at<=CASE WHEN s.id IS NULL THEN ?1-30*86400 ELSE ?1-s.retention_days*86400 END))";
 const cursor = (key: string) => `COALESCE((SELECT value FROM mailbox_meta WHERE key='${key}'),0)`;
 const setCursor = (db: D1Database, key: string, value: number) => db.prepare(
@@ -24,8 +25,8 @@ export async function maintain(db: D1Database, now: number): Promise<number> {
     const { results, meta } = await db.prepare(
       "WITH scan AS MATERIALIZED (SELECT id FROM messages WHERE id>" + cursor("sweep_messages") +
       " ORDER BY id LIMIT ?2)" +
-      " SELECT m.id,m.room_id," + deadSpace + " AS dead," +
-      " CASE WHEN " + expired + " THEN 12+CASE WHEN s.status='deleted' THEN 8 ELSE 0 END" +
+      " SELECT m.id,m.room_id," + discarded + " AS dead," +
+      " CASE WHEN " + expired + " THEN 12+CASE WHEN " + discarded + " THEN 8 ELSE 0 END" +
       " +8*(SELECT count(*) FROM question_targets WHERE question_id=m.id)" +
       " +12*EXISTS(SELECT 1 FROM message_images WHERE message_id=m.id)" +
       " +12*(SELECT count(*) FROM question_targets WHERE reply_id=m.id) ELSE 0 END AS cost" +
@@ -56,8 +57,8 @@ export async function maintain(db: D1Database, now: number): Promise<number> {
         ...reserveBulk(db, day, CRON_CEILING,
           "?+4*(SELECT count(*) FROM messages WHERE " + orphaned + ")", cost, visitedIds, selected),
         db.prepare("INSERT OR IGNORE INTO explicit_room_deletion(room_id) SELECT DISTINCT m.room_id" +
-          joins + " WHERE " + set + " AND " + deadSpace).bind(now, selected),
-        db.prepare("DELETE FROM messages WHERE id IN (SELECT m.id" + joins + " WHERE " + set + " AND " + expired + ")")
+          joins + " WHERE " + set + " AND " + discarded).bind(now, selected),
+        db.prepare("DELETE FROM messages WHERE id IN (SELECT m.id" + joins + " WHERE " + set + " AND " + expired + ") RETURNING id")
           .bind(now, selected),
         db.prepare("DELETE FROM explicit_room_deletion WHERE room_id IN (SELECT value FROM json_each(?))")
           .bind(JSON.stringify([...rooms])),
@@ -65,7 +66,7 @@ export async function maintain(db: D1Database, now: number): Promise<number> {
           " AND NOT EXISTS(SELECT 1 FROM messages parent WHERE parent.id=messages.reply_to)").bind(visitedIds),
         setCursor(db, "sweep_messages", advance),
       ]);
-      removed = result[3].meta.changes ?? 0;
+      removed = result[3].results.length;
     }
 
     const dead = await db.prepare("WITH scan AS MATERIALIZED (SELECT rowid,id,status,deleted_at FROM spaces WHERE rowid>" +
@@ -94,11 +95,15 @@ export async function maintain(db: D1Database, now: number): Promise<number> {
     ]);
 
     // Retired rooms can be removed once their old messages have drained in bounded pages.
-    const retired = eligible.length ? await db.prepare(
+    const closedEmpty = await db.prepare(
+      "SELECT room.id FROM (SELECT id FROM rooms WHERE owner_id=? ORDER BY rowid LIMIT ?)" +
+      " room WHERE NOT EXISTS(SELECT 1 FROM messages WHERE room_id=room.id) LIMIT 1",
+    ).bind(CLOSED_ROOM_OWNER, SPACE_SCAN).first<string>("id");
+    const retired = closedEmpty ?? (eligible.length ? await db.prepare(
       "SELECT r.id FROM json_each(?2) candidate CROSS JOIN spaces s ON s.id=candidate.value" +
       " CROSS JOIN rooms r ON r.owner_id=s.id WHERE " + deadSpace +
       " AND NOT EXISTS(SELECT 1 FROM messages WHERE room_id=r.id) LIMIT 1",
-    ).bind(now, candidates).first<string>("id") : null;
+     ).bind(now, candidates).first<string>("id") : null);
     if (retired) await db.batch([
       ...reserveBulk(db, day, CRON_CEILING, roomDeletionCost, retired, retired, retired),
       db.prepare("DELETE FROM rooms WHERE id=? AND NOT EXISTS(SELECT 1 FROM messages WHERE room_id=?)").bind(retired, retired),

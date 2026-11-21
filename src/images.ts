@@ -67,9 +67,10 @@ function limit(setting: string | undefined, fallback: number, maximum: number) {
 }
 
 export function imageUsageLimits(env: ImageSettings) {
+  const edge = env.IMAGE_MAX_EDGE;
   return {
     image_max_bytes: limit(env.IMAGE_MAX_BYTES, DEFAULT_IMAGE_BYTES, MAX_IMAGE_BYTES),
-    image_max_edge: limit(env.IMAGE_MAX_EDGE, DEFAULT_IMAGE_EDGE, MAX_IMAGE_EDGE),
+    image_max_edge: limit(Number(edge) === 0 ? undefined : edge, DEFAULT_IMAGE_EDGE, MAX_IMAGE_EDGE),
     images_per_day: limit(env.IMAGE_SPACE_DAILY, IMAGE_SPACE_DAILY, 500),
     site_images_per_day: limit(env.IMAGE_SITE_DAILY, IMAGE_SITE_DAILY, 5_000),
     image_storage_bytes: limit(env.IMAGE_SPACE_BYTES, IMAGE_SPACE_BYTES, 300_000_000),

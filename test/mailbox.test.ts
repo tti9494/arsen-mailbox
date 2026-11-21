@@ -476,6 +476,7 @@ describe("limits", () => {
 
   it("rate-limits failed keys per source address", async () => {
     const roomId = await room();
+    vi.spyOn(Date, "now").mockReturnValue(Math.floor(Date.now() / 60_000) * 60_000 + 15_000);
     const [fails] = LIMITS.auth_fail;
     const from = (ip: string) => ({ "cf-connecting-ip": ip });
     for (let i = 0; i < fails; i++) {

@@ -25,16 +25,17 @@ import {
 } from "./app";
 import { MAX_ROOM_PARTICIPANTS, MAX_ROOMS, SPACE_LIMITS } from "./brand";
 import {
-  capStage, dayCount, dayStart, estimateBindings, estimatedWrites, roomDeletionCost,
-  spaceDailyWriteLimit, spaceRevocationCost, STOP_MUTATIONS, STOP_TRAFFIC,
+  capStage, DailyCapacity, dayCount, dayStart, estimateBindings, estimatedWrites, roomDeletionCost,
+  spaceDailyWriteLimit, spaceRevocationCost, STOP_MUTATIONS, STOP_TRAFFIC, type WriteCost,
 } from "./budget";
 import { enroll, newRecoveryCodes } from "./enrollment";
 import { EXPORT_READ_COST, exportPage } from "./export";
 import { cleanName, cleanText, isPreviewBot, LIMITS, Refused } from "./policy";
-import { historyStart, retentionCutoff, retentionGuard } from "./retention";
+import { CLOSED_ROOM_OWNER, historyStart, retentionCutoff, retentionGuard } from "./retention";
+import { rejectRecentlyDenied, rememberDenied } from "./auth-window";
 import { avatarFields, readAvatars } from "./avatars";
 import { requireSql, refusal } from "./transaction";
-import { spaceLimit, spaceRateError, takeParticipantRead, takeSpaceLimit, type SpaceReadUsage } from "./traffic";
+import { spaceLimit, spaceRateError, spaceReadHeadroom, takeParticipantRead, takeSpaceLimit, type SpaceReadUsage } from "./traffic";
 import { imageUsageArgs, imageUsageLimits, imageUsageSql, imageUploadsOn, loadImage } from "./images";
 
 export async function serveAsset(request: Request, env: Env, url: URL) {
@@ -102,11 +103,14 @@ async function spaceCredential(request: Request, env: Env, revoke: boolean, defe
   const auth = request.headers.get("authorization");
   if (!auth) throw new Refused("unauthorized");
   const source = await sourceOf(request, env);
-  if (await exhausted(env, "auth_fail", source)) throw new Refused("rate_limited");
+  const now = nowSeconds();
   const key = /^Bearer (ams_[\w-]{32})$/i.exec(auth)?.[1];
+  const hash = key ? await sha256hex(key) : "";
+  const credential = key ? "space:" + hash : "";
+  rejectRecentlyDenied(env.DB, source, credential, now);
+  if (await exhausted(env, "auth_fail", source)) throw new Refused("rate_limited");
   // Only these two revocation routes may match the currently stored key during an explicit maintenance closure.
   const requiredEpoch = revoke && env.KEY_EPOCH === "closed" ? null : await currentEpoch(env);
-  const hash = key ? await sha256hex(key) : "";
   const space = await env.DB.prepare(
     "SELECT id,key_epoch,retention_days,retention_rev,request_day,request_count,request_write_estimate,request_minute,request_minute_count" +
     " FROM spaces WHERE key_hash=? AND status='active' AND (? IS NULL OR key_epoch=?)",
@@ -114,7 +118,10 @@ async function spaceCredential(request: Request, env: Env, revoke: boolean, defe
     .bind(hash, requiredEpoch, requiredEpoch)
     .first<{ id: string; key_epoch: number; retention_days: number | null; retention_rev: number } & SpaceReadUsage>();
   if (!space) {
-    if (!(await allow(env, "auth_fail", source))) throw new Refused("rate_limited");
+    if (!(await allow(env, "auth_fail", source))) {
+      rememberDenied(env.DB, source, credential, nowSeconds());
+      throw new Refused("rate_limited");
+    }
     throw new Refused("forbidden");
   }
   const epoch = space.key_epoch;
@@ -683,11 +690,30 @@ export async function api(request: Request, env: Env, url: URL) {
   }
   if (method === "DELETE") {
     const now = nowSeconds();
-    const scope = spaceLimit(db, space.id, now, true, [roomDeletionCost, room, room, room],
-      STOP_MUTATIONS, space.allocation);
-    await db.batch([...guards, ...scope.guards, ...scope.updates, db.prepare("DELETE FROM rooms WHERE id=?").bind(room)])
-      .catch(e => spaceRateError(db, space.id, now, e));
-    return json({ deleted: true });
+    spaceReadHeadroom(space.usage, now, true, space.allocation, 24);
+    const remove = (cost: WriteCost, changes: D1PreparedStatement[]) => {
+      const scope = spaceLimit(db, space.id, now, true, cost, STOP_MUTATIONS, space.allocation);
+      return db.batch([...guards, ...scope.guards, ...scope.updates, ...changes])
+        .catch(e => spaceRateError(db, space.id, now, e));
+    };
+    try {
+      await remove([roomDeletionCost, room, room, room], [db.prepare("DELETE FROM rooms WHERE id=?").bind(room)]);
+      return json({ deleted: true });
+    } catch (error) {
+      const reason = refusal(error);
+      if (!(reason instanceof DailyCapacity)) throw reason ?? error;
+    }
+    // Detach the room and invalidate its live credentials in the same transaction.
+    // A Worker rollback also hides the detached room and cannot use its revoked keys.
+    const participantIds = "SELECT id FROM participants WHERE room_id=?";
+    await remove(["32+16*(SELECT count(*) FROM participants WHERE room_id=? AND revoked=0)" +
+      "+8*(SELECT count(*) FROM participants p CROSS JOIN send_tickets t ON t.participant_id=p.id WHERE p.room_id=?)",
+      room, room], [
+      db.prepare("UPDATE participants SET revoked=1 WHERE room_id=? AND revoked=0").bind(room),
+      db.prepare("DELETE FROM send_tickets WHERE participant_id IN (" + participantIds + ")").bind(room),
+      db.prepare("UPDATE rooms SET owner_id=? WHERE id=?").bind(CLOSED_ROOM_OWNER, room),
+    ]);
+    return json({ deleted: true, cleanup_pending: true });
   }
   throw new Refused("not_found");
 }

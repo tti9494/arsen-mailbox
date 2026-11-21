@@ -124,7 +124,7 @@ try {
     return response.json();
   }
   const release = "?v=2.3.0";
-  const appEntry = "/js/app.js" + release + "&history=2";
+  const appEntry = "/js/app.js" + release + "&history=2&maintenance=1";
   for (const path of ["/", "/app", "/app/", "/app/legacy/", "/r/legacy/", "/r/legacy", "/help.html"]) {
     const r = await fetch(base + path, { redirect: "manual" });
     assert.equal(r.status, 200, "asset " + path);
@@ -133,7 +133,7 @@ try {
     assert.ok(r.headers.get("content-security-policy").includes("frame-ancestors 'none'"));
     const html = await r.text();
     const help = path === "/help.html";
-    const entry = help ? "/js/help-init.js" + release : appEntry.replace("&", "&amp;");
+    const entry = help ? "/js/help-init.js" + release : appEntry.replaceAll("&", "&amp;");
     assert.ok(html.includes("아르센 우편함") && html.includes('src="' + entry + '"'));
     const styles = help ? ["tokens", "styles"] : ["tokens", "styles", "chat-skins"];
     for (const style of styles) assert.ok(html.includes('href="/css/' + style + '.css' + release + '"'));
@@ -145,7 +145,7 @@ try {
     assert.equal(r.status, 200, path);
     for (const [, specifier] of (await r.text()).matchAll(/\bfrom\s+"(\.[^"]+)"/g)) {
       const target = new URL(specifier, base + path);
-      assert.equal(target.search, release + (target.pathname === "/js/sheets.js" ? "&history=2" : ""), path + " imports " + specifier);
+      assert.equal(target.search, release + (target.pathname === "/js/sheets.js" ? "&history=2&maintenance=1" : ""), path + " imports " + specifier);
       modules.add(target.pathname + target.search);
     }
   }

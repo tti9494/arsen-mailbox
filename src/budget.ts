@@ -99,6 +99,9 @@ export const spaceRevocationCost = "32+(SELECT COALESCE(SUM(2+12*(p.revoked=0)),
   "+8*(SELECT count(*) FROM rooms r CROSS JOIN participants p ON p.room_id=r.id" +
   " CROSS JOIN send_tickets t ON t.participant_id=p.id WHERE r.owner_id=?)";
 const pressureCache = new WeakMap<D1Database, { window: number; pending: Promise<CapacitySnapshot> }>();
+export function refreshCapacityOnRefusal(db: D1Database, reason: DailyCapacity) {
+  if (reason.scope === "service_day") pressureCache.delete(db);
+}
 export function recentCapacity(db: D1Database, now: number) {
   const window = Math.floor(now / 60);
   const cached = pressureCache.get(db);

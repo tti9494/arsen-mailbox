@@ -3,11 +3,12 @@
 import { MAX_ROOM_PARTICIPANTS, SPACE_LIMITS } from "./brand";
 import {
   addWriteEstimate, budgetGuard, DailyCapacity, dayCount, dayStart,
-  pollCharge, recentCapacity, requireCapacity, spaceDailyWriteLimit, SLOW_READS, STOP_MUTATIONS, STOP_TRAFFIC,
+  pollCharge, recentCapacity, refreshCapacityOnRefusal, requireCapacity, spaceDailyWriteLimit, SLOW_READS, STOP_MUTATIONS, STOP_TRAFFIC,
 } from "./budget";
 import { minute, participantReadGuard, spaceLimit, spaceReadHeadroom, takeParticipantRead, takeSpaceLimit, type SpaceReadUsage } from "./traffic";
 import { reusableTicket, verifyReusableTicket } from "./send-confirmation";
 import { requireSql, refusal } from "./transaction";
+import { rejectRecentlyDenied, rememberDenied } from "./auth-window";
 import { api, apiError, serveAsset } from "./v2";
 import { assistantText, humanLink } from "./guide";
 import { cleanName, cleanText, isPreviewBot, LIMITS, Refused } from "./policy";
@@ -387,11 +388,18 @@ export async function authenticate(
   readCost = 2,
 ): Promise<Participant> {
   if (isPreviewBot(request.headers)) throw new Refused("preview_refused");
-  const epoch = await currentEpoch(env);
   const source = await sourceOf(request, env);
+  const now = nowSeconds();
+  const hash = key ? await sha256hex(key) : "";
+  const credential = roomId + ":" + hash;
+  rejectRecentlyDenied(env.DB, source, credential, now);
+  const epoch = await currentEpoch(env);
   if (await exhausted(env, "auth_fail", source)) throw new Refused("rate_limited");
   if (!key) {
-    if (!(await allow(env, "auth_fail", source))) throw new Refused("rate_limited");
+    if (!(await allow(env, "auth_fail", source))) {
+      rememberDenied(env.DB, source, credential, nowSeconds());
+      throw new Refused("rate_limited");
+    }
     throw new Refused("key_missing");
   }
   const who = await env.DB.prepare(
@@ -402,11 +410,14 @@ export async function authenticate(
       " FROM participants p JOIN rooms r ON r.id = p.room_id LEFT JOIN spaces s ON s.id=r.owner_id" +
       " WHERE (s.id IS NULL OR s.status='active') AND p.is_owner=0 AND p.key_hash = ? AND p.revoked = 0 AND p.key_epoch = ?",
   )
-    .bind(await sha256hex(key), epoch)
+    .bind(hash, epoch)
     .first<Participant>();
   // wrong key, revoked key, old-epoch key and another room's key look the same from outside
   if (!who || who.room_id !== roomId) {
-    if (!(await allow(env, "auth_fail", source))) throw new Refused("rate_limited");
+    if (!(await allow(env, "auth_fail", source))) {
+      rememberDenied(env.DB, source, credential, nowSeconds());
+      throw new Refused("rate_limited");
+    }
     throw new Refused("forbidden");
   }
   if (bucket === "read") {
@@ -450,18 +461,11 @@ export async function readWithTicket(
   const allocation = spaceDailyWriteLimit(env.SPACE_DAILY_WRITE_LIMIT);
   const reusable = withTicket && who.space_id !== null && Boolean(env.SOURCE_HASH_KEY?.trim());
   const minimum = Math.max(pollCharge(active_spaces, 0), withTicket && !reusable ? 16 : 0);
-  async function refuseEarly(reason: unknown): Promise<never> {
-    if (estimate >= SLOW_READS) await requireCapacity(db, STOP_TRAFFIC, minimum);
-    throw reason;
-  }
+  const checkLive = estimate >= STOP_MUTATIONS;
+  if (checkLive) await requireCapacity(db, STOP_TRAFFIC, minimum);
   if (!who.space_guard && who.read_minute === minute(now) && who.read_count >= LIMITS.read[0])
-    return refuseEarly(new Refused("rate_limited", 60 - now % 60));
-  let spaceRemaining: number;
-  try {
-    spaceRemaining = who.space_id ? spaceReadHeadroom(who, now, Boolean(who.space_guard), allocation, minimum) : Infinity;
-  } catch (reason) {
-    return refuseEarly(reason);
-  }
+    throw new Refused("rate_limited", 60 - now % 60);
+  const spaceRemaining = who.space_id ? spaceReadHeadroom(who, now, Boolean(who.space_guard), allocation, minimum) : Infinity;
   if (STOP_TRAFFIC - estimate < minimum) throw new DailyCapacity(now);
   // Near the ceiling bound the cost even when the exact quote is rejected by the transaction.
   const size = Math.min(spaceRemaining, STOP_TRAFFIC - estimate) < 300 ? 4 : HISTORY_PAGE;
@@ -477,7 +481,7 @@ export async function readWithTicket(
   if (cooling) {
     const newest = await db.prepare("SELECT id,created_at FROM messages WHERE room_id=? AND human_origin=1 AND id>? ORDER BY id DESC LIMIT 1")
       .bind(who.room_id, start).first<{ id: number; created_at: number }>();
-    if (!newest || newest.created_at <= cutoff) return refuseEarly(new Refused("rate_limited", guardedAt + cooldown - now));
+    if (!newest || newest.created_at <= cutoff) throw new Refused("rate_limited", guardedAt + cooldown - now);
     indexedHumanId = newest.id;
   }
   const window = backward ? historyTail("?4", "?5", "?6", "?7", size, seek) :
@@ -515,13 +519,14 @@ export async function readWithTicket(
   const progress = Math.max(delivered, scanNext);
   const catchingUp = indexedHumanId > delivered && more && progress > start;
   if (cooling && freshHumanId <= who.last_read_id && !catchingUp)
-    return refuseEarly(new Refused("rate_limited", guardedAt + cooldown - now));
+    throw new Refused("rate_limited", guardedAt + cooldown - now);
   const context = who.space_id && ids.length ? await questionContext(db, who.room_id, ids, cutoff) : null;
   const relay = limited && Boolean(await hasRelay(db, who.id).first());
   const storedTicket = withTicket && !reusable ? "amt_" + token(16) : "";
   const statements = who.space_guard ? [who.space_guard] : [];
   statements.push(requireSql(db, "forbidden", STILL_VALID, who.id, who.key_hash, who.key_epoch));
-  const costForReads = pollCharge(active_spaces, meta.rows_read + (cooling ? 2 : 0) + (catchingUp ? 3 : 0) +
+  const costForReads = pollCharge(active_spaces, meta.rows_read + (checkLive ? active_spaces + 2 : 0) +
+    (cooling ? 2 : 0) + (catchingUp ? 3 : 0) +
     (context?.rows ?? 0) + (relay ? RELAY_ROWS : 0));
   const readCost = storedTicket ? Math.max(costForReads, 16) : costForReads;
   const scope = who.space_id ? spaceLimit(db, who.space_id, now, Boolean(who.space_guard), readCost, STOP_TRAFFIC, allocation) : null;
@@ -1003,14 +1008,21 @@ async function ownerOf(request: Request, env: Env, ceiling = STOP_TRAFFIC): Prom
   const key = /^bearer\s+/i.test(auth) ? auth.replace(/^bearer\s+/i, "").trim() : ""; // header only, never query
   if (!key) throw new Refused("key_missing");
   const source = await sourceOf(request, env);
+  const now = nowSeconds();
+  const hash = await sha256hex(key);
+  const credential = "operator:" + hash;
+  rejectRecentlyDenied(env.DB, source, credential, now);
   if (await exhausted(env, "auth_fail", source)) throw new Refused("rate_limited");
-  const a = encoder.encode(await sha256hex(key));
+  const a = encoder.encode(hash);
   const match = configured.find((c) => {
     const b = encoder.encode(c.hash);
     return a.byteLength === b.byteLength && crypto.subtle.timingSafeEqual(a, b);
   });
   if (!match) {
-    if (!(await allow(env, "auth_fail", source))) throw new Refused("rate_limited");
+    if (!(await allow(env, "auth_fail", source))) {
+      rememberDenied(env.DB, source, credential, nowSeconds());
+      throw new Refused("rate_limited");
+    }
     throw new Refused("forbidden");
   }
   const owner = match.owner;
@@ -1192,14 +1204,20 @@ async function handleRequest(request: Request, env: Env, url: URL): Promise<Resp
     if (env.ASSETS && ["GET", "HEAD"].includes(request.method)) return await serveAsset(request, env, url);
     return error("not_found", false);
   } catch (e) {
-    if (e instanceof DailyCapacity) return dailyCapacityResponse(e, plainError);
+    if (e instanceof DailyCapacity) {
+      refreshCapacityOnRefusal(env.DB, e);
+      return dailyCapacityResponse(e, plainError);
+    }
     if (e instanceof ImageLimit) {
       const response = json({ error: e.code, scope: e.scope, message: e.messageForUser, retry_after: e.retryAfter }, 429);
       if (e.retryAfter) response.headers.set("retry-after", String(e.retryAfter));
       return response;
     }
     const refused = refusal(e);
-    if (refused instanceof DailyCapacity) return dailyCapacityResponse(refused, plainError);
+    if (refused instanceof DailyCapacity) {
+      refreshCapacityOnRefusal(env.DB, refused);
+      return dailyCapacityResponse(refused, plainError);
+    }
     if (/exceeded D1.s free tier daily row (?:read|write) limit|SQLITE_FULL/i.test(String(e))) {
       return dailyCapacityResponse(new DailyCapacity(), plainError);
     }

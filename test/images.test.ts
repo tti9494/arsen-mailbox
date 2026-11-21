@@ -247,11 +247,12 @@ it("applies deployment byte and count settings and leaves ordinary text availabl
   const narrow = await call(p + "/image", { ...image, settings: { IMAGE_MAX_EDGE: "2" } });
   expect(narrow.status).toBe(413);
   expect(await narrow.json()).toEqual({ error: "image_dimensions", image_max_bytes: 48000, image_max_edge: 2 });
-  const accepted = await call(p + "/image", { ...image, settings: { IMAGE_SPACE_DAILY: "1" } });
+  const accepted = await call(p + "/image", { ...image, settings: { IMAGE_SPACE_DAILY: "1", IMAGE_MAX_EDGE: "0" } });
   expect(accepted.status).toBe(200);
   const count = await call(p + "/image", { ...image, settings: { IMAGE_SPACE_DAILY: "1" } });
   expect(await count.json()).toMatchObject({ error: "quota", scope: "space_daily" });
-  const usage = await (await call("/api/me", { key: f.owner, settings: { IMAGE_MAX_BYTES: "60", IMAGE_SPACE_DAILY: "1" } })).json();
+  const usage = await (await call("/api/me", { key: f.owner,
+    settings: { IMAGE_MAX_BYTES: "60", IMAGE_SPACE_DAILY: "1", IMAGE_MAX_EDGE: "0" } })).json();
   expect(usage).toMatchObject({ limits: { image_max_bytes: 60, image_max_edge: 2048, images_per_day: 1 },
     usage: { image_storage_bytes: png().length, images_today: 1 } });
   const text = await call(p + "/send", { method: "POST", key: f.first.key,

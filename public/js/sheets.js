@@ -1546,22 +1546,21 @@ export function openRoomManageSheet(sheets, { room, trigger, onRenameRoom, onDel
 
       const delBtn = makeTwoStepButton(
         "이 방 삭제하기",
-        "한 번 더 누르면 방과 대화 즉시 삭제",
+        "한 번 더 누르면 방을 바로 닫고 대화를 삭제합니다",
         "btn btn-danger btn-block",
         async () => {
           try {
             await onDeleteRoom(room.room_id);
             closeSheet();
           } catch (ex) {
-            errLine.textContent = ex?.code === "space_operation_quota"
-              ? "이 방의 글과 답변 연결이 한 번에 처리할 수 있는 한도를 넘었습니다. 참가자 열쇠를 끊어 접근을 막거나, 보관 기간이 끝난 글이 정리된 뒤 다시 시도해 주세요."
-              : errorMessage(ex);
+            errLine.textContent = errorMessage(ex);
             errLine.hidden = false;
           }
         },
       );
 
-      bodyBox.append(renameForm, delBtn, errLine);
+      bodyBox.append(renameForm, delBtn, el("p", { className: "field-hint",
+        text: "삭제하면 참가자 접근이 바로 끊깁니다. 대화가 많은 방의 기록과 이미지는 정기 작업에서 나누어 지웁니다." }), errLine);
     },
   });
 }

@@ -59,7 +59,7 @@ import {
   openRoomCreateSheet,
   openRoomManageSheet,
   serverParticipantStatus,
-} from "./sheets.js?v=2.3.0&history=2";
+} from "./sheets.js?v=2.3.0&history=2&maintenance=1";
 import { PARTICIPANT_FILTERS, participantNotes, participantRole, participantRoleLabel } from "./participant-avatar.js?v=2.3.0";
 import { initTheme } from "./theme.js?v=2.3.0";
 import { createImagePicker, createImageViewer, formatImageBytes, postImage } from "./images.js?v=2.3.0";
@@ -2821,7 +2821,7 @@ function renderOwnerApp() {
                     onDeleteRoom: async (rid) => {
                       const generation = state.sessionGen;
                       bumpRoomGen();
-                      await apiRequest(`/api/rooms/${encodeURIComponent(rid)}`, {
+                      const result = await apiRequest(`/api/rooms/${encodeURIComponent(rid)}`, {
                         method: "DELETE",
                         spaceKey: getSpaceKey(),
                       });
@@ -2831,6 +2831,10 @@ function renderOwnerApp() {
                       window.history.replaceState(null, "", "/app");
                       state.mobilePane = "rooms";
                       await loadSpaceBootstrap();
+                      if (result.cleanup_pending && generation === state.sessionGen) {
+                        state.statusBanner = { kind: "accent", text: "방을 닫았습니다. 기록과 이미지는 정기 작업에서 나누어 지웁니다." };
+                        renderApp();
+                      }
                     },
                   }),
               },

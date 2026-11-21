@@ -908,7 +908,7 @@ describe("security review repairs", () => {
       .first("request_write_estimate")).toBe(66);
   });
 
-  it("uses the configured space allocation and distinguishes an oversized single deletion from daily exhaustion", async () => {
+  it("closes an oversized room inside the configured space allocation and still refuses a depleted space", async () => {
     const s = await ok(signup());
     const r = await room(s.key);
     const tuned = { ...local, SPACE_DAILY_WRITE_LIMIT: "1000" };
@@ -919,9 +919,8 @@ describe("security review repairs", () => {
       " WHERE room_id=? AND is_owner=1",
     ).bind(r.room_id).run();
     const deleting = await call("/api/rooms/" + r.room_id, "DELETE", s.key, undefined, tuned);
-    expect(deleting.status).toBe(429);
-    expect(deleting.headers.has("retry-after")).toBe(false);
-    expect(await deleting.json()).toMatchObject({ error: "quota", scope: "space_operation" });
+    expect(deleting.status).toBe(200);
+    expect(await deleting.json()).toMatchObject({ deleted: true, cleanup_pending: true });
     expect(await db.prepare("SELECT count(*) AS n FROM messages WHERE room_id=?").bind(r.room_id).first("n")).toBe(8000);
     await db.prepare("UPDATE spaces SET request_day=?,request_write_estimate=1000 WHERE id=?")
       .bind(dayStart(),s.space_id).run();
@@ -929,6 +928,8 @@ describe("security review repairs", () => {
     expect(rejected.status).toBe(429);
     expect(rejected.headers.has("retry-after")).toBe(true);
     expect(await rejected.json()).toMatchObject({ error: "quota", scope: "space_day" });
+    // This synthetic room is queued for cleanup. Later policy tests use their own retention fixtures.
+    await db.prepare("DELETE FROM rooms WHERE id=?").bind(r.room_id).run();
   });
 
 

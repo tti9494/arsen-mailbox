@@ -1,5 +1,7 @@
 export const SECONDS_PER_DAY = 86400;
 export const HISTORY_PAGE = 50;
+// The sentinel cannot be issued as a space ID or matched by an admin owner key.
+export const CLOSED_ROOM_OWNER = "!closed-room";
 
 export function retentionCutoff(days: number | null, now: number) {
   return days === null ? Number.MIN_SAFE_INTEGER : now - days * SECONDS_PER_DAY;
