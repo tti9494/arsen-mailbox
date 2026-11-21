@@ -67,7 +67,7 @@ function checkText(raw) {
   if (CONTROL_PATTERN.test(norm)) return { err: "invalid" };
   const s = norm.trim();
   if (!s) return { err: "invalid" };
-  if ([...s].length > 2000 || utf8.encode(s).byteLength > SPACE_LIMITS.message_bytes) {
+  if ([...s].length > SPACE_LIMITS.max_chars || utf8.encode(s).byteLength > SPACE_LIMITS.message_bytes) {
     return { err: "invalid" };
   }
   if (SENSITIVE_PATTERN.test(s)) return { err: "invalid" };

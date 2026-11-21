@@ -1,4 +1,5 @@
 import { assistantDefault, DEFAULT_INTERVAL_MINUTES } from "./assistant-defaults.js?v=2.2.2";
+import { MAX_SEND_CHUNKS, splitProblem } from "./message-split.js?v=2.2.2";
 export { DEFAULT_INTERVAL_MINUTES, INTERVAL_PRESETS } from "./assistant-defaults.js?v=2.2.2";
 
 // 브랜드 상수·한도·참가자 종류·검증 규칙 (src/brand.ts 및 src/policy.ts 정합)
@@ -10,8 +11,8 @@ export const SPACE_LIMITS = Object.freeze({
   rooms: 5,
   participants: 8,
   messages_per_day: 500,
-  message_bytes: 4096,
-  max_chars: 2000,
+  message_bytes: 16384,
+  max_chars: 6000,
   retention_days: 30,
   assistant_read_seconds: 30,
 });
@@ -279,7 +280,8 @@ export const ERROR_MESSAGES = {
   signup_closed: "지금은 새 공간 가입이 일시 중지되어 있습니다. 잠시 뒤 다시 확인해 주세요.",
   key_epoch_invalid: "서버 열쇠 세대가 갱신되어 열쇠를 다시 발급받아야 합니다.",
   text_sensitive: "비밀번호·인증번호·열쇠처럼 보이는 내용은 보낼 수 없습니다.",
-  text_too_long: "글이 너무 깁니다(최대 2,000자 · 4KB 이내).",
+  text_too_long: "글이 너무 깁니다(최대 6,000자 · 16KB 이내). 나눠서 보내 주세요.",
+  text_too_long_total: "글이 너무 깁니다. 나눠 보내도 글 5개(약 2만 7천자)를 넘을 수 없어요.",
   offline: "오프라인 상태입니다. 인터넷 연결이 돌아오면 자동으로 다시 읽습니다.",
   network: "서버에 연결하지 못했습니다. 잠시 뒤 다시 시도해 주세요.",
 };
@@ -294,14 +296,21 @@ export function errorMessage(err) {
 
 const utf8Encoder = new TextEncoder();
 
-export function validateMessageInput(raw) {
+/** `split: true`는 입력창용: 글 1건 한도를 넘어도 MAX_SEND_CHUNKS건 안에서 나눠 보낼 수 있으면 통과합니다. */
+export function validateMessageInput(raw, { split = false } = {}) {
   if (typeof raw !== "string") return "보낼 내용을 입력해 주세요.";
   const normalized = raw.replace(/\r\n?/g, "\n").normalize("NFC");
   if (CONTROL_PATTERN.test(normalized)) return "본문에 쓸 수 없는 제어 문자가 포함되어 있습니다.";
   const trimmed = normalized.trim();
   if (!trimmed) return "";
-  if ([...trimmed].length > SPACE_LIMITS.max_chars) return ERROR_MESSAGES.text_too_long;
-  if (utf8Encoder.encode(trimmed).byteLength > SPACE_LIMITS.message_bytes) return ERROR_MESSAGES.text_too_long;
+  if (split) {
+    if ([...trimmed].length > SPACE_LIMITS.max_chars * MAX_SEND_CHUNKS || splitProblem(trimmed)) {
+      return ERROR_MESSAGES.text_too_long_total;
+    }
+  } else {
+    if ([...trimmed].length > SPACE_LIMITS.max_chars) return ERROR_MESSAGES.text_too_long;
+    if (utf8Encoder.encode(trimmed).byteLength > SPACE_LIMITS.message_bytes) return ERROR_MESSAGES.text_too_long;
+  }
   if (SENSITIVE_PATTERN.test(trimmed)) return ERROR_MESSAGES.text_sensitive;
   return "";
 }

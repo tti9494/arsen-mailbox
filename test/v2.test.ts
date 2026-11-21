@@ -747,9 +747,9 @@ describe("rooms, participants and messages", () => {
       ),
     );
     expect(more.map((r) => r.status).sort()).toEqual([200, 200, 200, 200, 200, 200, 429]);
-    await denied(call(path + "/messages", "POST", s.key, { text: "a".repeat(2001) }), 400, "invalid");
-    await denied(call(path + "/messages", "POST", s.key, { text: "한".repeat(1366) }), 400, "invalid");
-    await ok(call(path + "/messages", "POST", s.key, { text: "한".repeat(1048) + "a".repeat(952) }));
+    await denied(call(path + "/messages", "POST", s.key, { text: "a".repeat(6001) }), 400, "invalid");
+    await denied(call(path + "/messages", "POST", s.key, { text: "한".repeat(5462) }), 400, "invalid");
+    await ok(call(path + "/messages", "POST", s.key, { text: "한".repeat(5461) + "a" }));
     await db
       .prepare("UPDATE rate_hits SET count=499 WHERE bucket='space_posts' AND subject=? AND window_start=?")
       .bind(s.space_id, dayStart())

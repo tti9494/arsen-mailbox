@@ -1,6 +1,6 @@
 // 아르센 우편함 v2 메인 앱 컨트롤러 (화면 1~9 라우팅 · 폴링 · 보안 수칙 통합)
 
-import { apiRequest, isAuthRefusal } from "./api.js?v=2.2.2";
+import { ApiError, apiRequest, isAuthRefusal } from "./api.js?v=2.2.2";
 import { applyChatPreferences, notifyAssistantReply, openChatSettings, shouldSubmitMessage } from "./chat-settings.js?v=2.2.2";
 import {
   BRAND_NAME,
@@ -33,6 +33,7 @@ import {
   nowSeconds,
   refreshLiveCheckNodes,
 } from "./dom.js?v=2.2.2";
+import { MAX_SEND_CHUNKS, splitMessageText } from "./message-split.js?v=2.2.2";
 import {
   clearRoomKey,
   clearSpaceKey,
@@ -51,6 +52,7 @@ import {
   createSheetManager,
   makeTwoStepButton,
   openAddParticipantSheet,
+  openMessageSheet,
   openMobileMembersSheet,
   openParticipantDetailSheet,
   openRelaySheet,
@@ -99,7 +101,6 @@ const state = {
   avatarPending: new Map(),
   memberFilter: "all",
   guestMeta: { roomName: "", meName: "", meId: "" },
-  expandedMsgIds: new Set(),
   replyTo: null,
 
   mobilePane: "rooms", // 'rooms' | 'chat' | 'settings'
@@ -146,7 +147,6 @@ function resetSessionView() {
   state.retentionDays = 30;
   state.retentionRevision = 0;
   state.guestMeta = { roomName: "", meName: "", meId: "" };
-  state.expandedMsgIds.clear();
   state.replyTo = null;
   state.meInfo = null;
   state.lastOverviewAt = 0;
@@ -187,7 +187,6 @@ function wipeCurrentRoomCache(err) {
   state.questions.clear();
   state.notificationsArmed = false;
   state.lastMessageId = 0;
-  state.expandedMsgIds.clear();
   state.replyTo = null;
   if (state.currentRoomId) {
     state.participantsByRoom.delete(state.currentRoomId);
@@ -1007,7 +1006,6 @@ function resetRoomView(roomId) {
   state.lastMessageId = 0;
   state.guestMeta = { roomName: "", meName: "", meId: "" };
   state.memberFilter = "all";
-  state.expandedMsgIds.clear();
   state.replyTo = null;
   state.settingsOpen = false;
 }
@@ -1434,28 +1432,27 @@ function renderMessagesTimeline(scrollBox) {
 
     const bodyNode = buildSafeMessageNodes(m.text);
     const longMsg = isLongMessage(m.text);
-    const expanded = state.expandedMsgIds.has(m.id);
-    if (longMsg && !expanded) {
-      bodyNode.classList.add("is-clamped");
-    }
+    if (longMsg) bodyNode.classList.add("is-clamped");
 
-    let moreBtn = null;
-    if (longMsg) {
-      moreBtn = el(
-        "button",
-        {
-          type: "button",
-          className: "mini-action-btn",
-          "aria-expanded": String(expanded),
-          onClick: () => {
-            if (state.expandedMsgIds.has(m.id)) state.expandedMsgIds.delete(m.id);
-            else state.expandedMsgIds.add(m.id);
-            renderMessagesTimeline(scrollBox);
+    // 카톡식: 긴 글은 말풍선에서 앞부분만 보이고, 전체보기 창에서 끝까지 읽습니다.
+    const moreBtn = longMsg
+      ? el(
+          "button",
+          {
+            type: "button",
+            className: "mini-action-btn",
+            "aria-haspopup": "dialog",
+            onClick: (e) =>
+              openMessageSheet(sheets, {
+                sender: displaySender,
+                when: `${formatDateLabel(m.created_at)} ${formatTime(m.created_at)}`,
+                text: m.text,
+                trigger: e.currentTarget,
+              }),
           },
-        },
-        expanded ? "접기" : "더 보기",
-      );
-    }
+          "전체보기",
+        )
+      : null;
 
     const replyBtn = el(
       "button",
@@ -1682,11 +1679,13 @@ async function triggerRelayForParticipant(initialParticipantId = null, trigger =
     onOpenAdd: (trig) => triggerAddParticipant(trig),
     onPostRelayed: async ({ relayedFor, text }) => {
       if (session !== state.sessionGen || view !== state.roomGen) return;
-      const spaceKey = getSpaceKey();
-      await apiRequest(`/api/rooms/${encodeURIComponent(room.room_id)}/messages`, {
-        method: "POST",
-        spaceKey,
-        body: { text, relayed_for: relayedFor, ...(question ? { reply_to: question.id } : {}) },
+      await postChunked({
+        roomId: room.room_id,
+        spaceKey: getSpaceKey(),
+        participantKey: null,
+        text,
+        relayedFor,
+        replyTo: question ? question.id : null,
       });
       if (session === state.sessionGen && view === state.roomGen) await pollCurrentRoom(false);
     },
@@ -1887,12 +1886,44 @@ function buildChatSettingsButton(isGuest, label = "채팅 설정") {
   }, icon("settings"));
 }
 
+/** 긴 글을 나눠 차례로 올립니다. 첫 글만 지정한 답장 대상에 붙이고, 나머지는 첫 글에 잇습니다(질문 자동 호출 방지).
+ * 중간에 실패하면 이미 올라간 글은 되돌리지 않고, 아직 못 보낸 원문을 `remainingText`로 돌려줍니다. */
+async function postChunked({ roomId, spaceKey, participantKey, text, replyTo = null, relayedFor = null, onProgress = null }) {
+  const chunks = splitMessageText(text);
+  if (chunks.length > MAX_SEND_CHUNKS) throw new ApiError("text_too_long", 400);
+  let firstId = null;
+  for (let i = 0; i < chunks.length; i += 1) {
+    if (chunks.length > 1) onProgress?.(i + 1, chunks.length);
+    const parent = i === 0 ? replyTo : firstId;
+    try {
+      const data = await apiRequest(`/api/rooms/${encodeURIComponent(roomId)}/messages`, {
+        method: "POST",
+        spaceKey,
+        participantKey,
+        body: {
+          text: chunks[i].text,
+          ...(relayedFor ? { relayed_for: relayedFor } : {}),
+          ...(parent ? { reply_to: parent } : {}),
+        },
+      });
+      if (i === 0) firstId = data?.id ?? null;
+    } catch (ex) {
+      if (i > 0 && ex && typeof ex === "object") {
+        ex.sentCount = i;
+        ex.remainingText = chunks[i].rest;
+      }
+      throw ex;
+    }
+  }
+  return chunks.length;
+}
+
 function buildComposer({ isGuest }) {
   const textarea = el("textarea", {
     id: "composer-textarea",
     className: "composer-input",
     rows: "1",
-    maxlength: "2000",
+    maxlength: String(SPACE_LIMITS.max_chars * MAX_SEND_CHUNKS),
     placeholder: "메시지 입력…",
     "aria-label": "메시지 입력",
     "aria-describedby": "composer-shortcut-hint",
@@ -1903,6 +1934,8 @@ function buildComposer({ isGuest }) {
     className: "composer-hint",
     text: "Enter 보내기 · Shift+Enter 줄바꿈 (모바일은 보내기 버튼)",
   });
+  // 안내 문구는 채팅 설정이 보내기 키에 맞춰 다시 쓰므로, 분할 알림은 별도 줄에 둔다.
+  const splitNote = el("p", { id: "composer-split-note", className: "composer-hint", role: "status", hidden: true });
   const feedback = el("p", { className: "composer-feedback", role: "alert", hidden: true });
   const sendBtn = el(
     "button",
@@ -1924,7 +1957,10 @@ function buildComposer({ isGuest }) {
       const wrapRows = Math.max(1, Math.round((textarea.scrollHeight - 20) / 23.25));
       textarea.rows = Math.min(6, Math.max(newlineRows, wrapRows));
     }
-    const err = val.trim() ? validateMessageInput(val) : "";
+    const err = val.trim() ? validateMessageInput(val, { split: true }) : "";
+    const parts = !err && [...val].length > SPACE_LIMITS.max_chars ? splitMessageText(val).length : 1;
+    splitNote.textContent = parts > 1 ? `길어서 글 ${parts}개로 나눠 보냅니다.` : "";
+    splitNote.hidden = parts <= 1;
     feedback.textContent = err;
     feedback.hidden = !err;
     sendBtn.disabled = sending || !val.trim() || Boolean(err);
@@ -1964,7 +2000,7 @@ function buildComposer({ isGuest }) {
         e.preventDefault();
         if (sending) return;
         const raw = textarea.value;
-        const err = validateMessageInput(raw);
+        const err = validateMessageInput(raw, { split: true });
         if (err || !raw.trim()) return;
 
         const roomId = isGuest ? state.guestRoomId : state.currentRoomId;
@@ -1974,13 +2010,15 @@ function buildComposer({ isGuest }) {
         sending = true;
         sendBtn.disabled = true;
         try {
-          await apiRequest(`/api/rooms/${encodeURIComponent(roomId)}/messages`, {
-            method: "POST",
+          await postChunked({
+            roomId,
             spaceKey: isGuest ? null : getSpaceKey(),
             participantKey: isGuest ? getRoomKey(roomId) : null,
-            body: {
-              text: raw.trim(),
-              ...(state.replyTo ? { reply_to: state.replyTo.id } : {}),
+            text: raw,
+            replyTo: state.replyTo?.id ?? null,
+            onProgress: (done, total) => {
+              feedback.textContent = `보내는 중… (${done}/${total})`;
+              feedback.hidden = false;
             },
           });
           if (generation !== state.sessionGen || view !== state.roomGen) return;
@@ -1996,17 +2034,27 @@ function buildComposer({ isGuest }) {
             handleDefinitiveAuthRefusal(ex, isGuest);
             return;
           }
-          feedback.textContent = errorMessage(ex);
+          const partial = typeof ex?.remainingText === "string";
+          if (partial) {
+            // 앞 글은 이미 올라갔습니다. 남은 글만 입력창에 두고 다시 보낼 수 있게 합니다.
+            textarea.value = ex.remainingText;
+            syncInputState();
+            state.replyTo = null;
+            syncReplyBar();
+            pollCurrentRoom(false);
+          }
+          feedback.textContent = (partial ? `${ex.sentCount}개만 올라갔어요. 남은 글은 입력창에 두었어요. ` : "") + errorMessage(ex);
           feedback.hidden = false;
         } finally {
           sending = false;
-          sendBtn.disabled = !textarea.value.trim() || Boolean(validateMessageInput(textarea.value));
+          sendBtn.disabled = !textarea.value.trim() || Boolean(validateMessageInput(textarea.value, { split: true }));
         }
       },
     },
     el("div", { id: "composer-reply-bar", className: "reply-bar", hidden: true }),
     el("div", { className: "composer-row", role: "group", "aria-label": "메시지 작성" }, relayBtn, textarea, sendBtn),
     shortcutHint,
+    splitNote,
     feedback,
   );
 

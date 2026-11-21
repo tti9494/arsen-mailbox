@@ -32,7 +32,8 @@ export const TICKET_SECONDS = 30 * 60;
 const TICKETS_PER_PARTICIPANT = 5;
 const DUPLICATE_WINDOW = 10 * 60;
 const READ_LIMIT = 50;
-const MAX_BODY = 16 * 1024;
+// Room for message_bytes of text plus JSON escaping and the other fields.
+const MAX_BODY = 32 * 1024;
 const MAX_URL = 16 * 1024; // Cloudflare refuses longer URLs before the Worker anyway
 
 export const SECURITY_HEADERS: Record<string, string> = {
@@ -84,7 +85,7 @@ const HINT: Record<string, string> = {
   preview_refused: "링크 미리보기 요청은 받지 않습니다.",
   rate_limited: "요청이 너무 잦습니다. 잠시 뒤에 다시 하세요.",
   text_missing: "보낼 본문(text)이 없습니다.",
-  text_too_long: "본문은 2000자까지입니다.",
+  text_too_long: `본문은 ${SPACE_LIMITS.message_chars}자까지입니다. 더 길면 나눠서 보내세요.`,
   text_invalid: "본문에 쓸 수 없는 문자가 있습니다.",
   text_sensitive: "비밀번호·인증번호·키처럼 보이는 내용은 보낼 수 없습니다.",
   ticket_missing: "GET으로 쓸 때는 방을 먼저 읽고 c(확인값)를 붙여야 합니다.",

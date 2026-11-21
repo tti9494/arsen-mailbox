@@ -57,7 +57,7 @@ async function readJsonBody(req) {
   let total = 0;
   for await (const chunk of req) {
     total += chunk.length;
-    if (total > 16384) throw new Error("body_too_large");
+    if (total > 32768) throw new Error("body_too_large");
     chunks.push(chunk);
   }
   if (!total) return {};

@@ -17,12 +17,14 @@ import {
   validateIntervalMinutesInput,
   validateMessageInput,
   validateNameInput,
+  SPACE_LIMITS,
 } from "./constants.js?v=2.2.2";
 import { AVATAR_PRESETS, PARTICIPANT_FILTERS, avatarThumbnail, participantNotes, participantRole, participantRoleLabel } from "./participant-avatar.js?v=2.2.2";
 import {
   appendNodes,
   buildAvatar,
   buildLiveScheduleNode,
+  buildSafeMessageNodes,
   buildSafeTranscript,
   clearNode,
   describeAssistantSchedule,
@@ -32,6 +34,7 @@ import {
   resolveLastCheckedSeconds,
 } from "./dom.js?v=2.2.2";
 import { getKindUsageCounts, recordKindUsage } from "./keystore.js?v=2.2.2";
+import { MAX_SEND_CHUNKS } from "./message-split.js?v=2.2.2";
 
 /** 서버가 돌려준 status 값만으로 3단계 표시 정보를 만든다(클라이언트 추측 금지) */
 export function serverParticipantStatus(p) {
@@ -1338,7 +1341,7 @@ export function openRelaySheet(
         id: "relay-answer-text",
         className: "textarea",
         rows: "5",
-        maxlength: "2000",
+        maxlength: String(SPACE_LIMITS.max_chars * MAX_SEND_CHUNKS),
         placeholder: "AI(예: 하크·챗GPT·제미나이)에게서 받은 답을 여기에 붙여 넣으세요",
       });
 
@@ -1356,7 +1359,7 @@ export function openRelaySheet(
           className: "doc-list",
           onSubmit: async (e) => {
             e.preventDefault();
-            const checkErr = validateMessageInput(answerArea.value);
+            const checkErr = validateMessageInput(answerArea.value, { split: true });
             if (checkErr || !answerArea.value.trim()) {
               errLine.textContent = checkErr || "붙여 넣을 답 본문을 입력해 주세요.";
               errLine.hidden = false;
@@ -1375,7 +1378,9 @@ export function openRelaySheet(
               }
               closeSheet();
             } catch (err) {
-              errLine.textContent = errorMessage(err);
+              const partial = typeof err?.remainingText === "string";
+              if (partial) answerArea.value = err.remainingText; // 앞 글은 이미 올라갔으니 남은 글만 다시 보냅니다
+              errLine.textContent = (partial ? `${err.sentCount}개만 올라갔어요. 남은 글만 입력창에 두었어요. ` : "") + errorMessage(err);
               errLine.hidden = false;
               submitBtn.disabled = false;
             }
@@ -1410,6 +1415,40 @@ export function openRelaySheet(
 }
 
 /** 새 방 만들기 / 방 이름 바꾸기·삭제 시트 */
+/** 카톡식 전체보기: 말풍선에서 잘린 긴 글을 끝까지 읽고 복사합니다. 본문은 말풍선과 같은 안전 렌더링을 씁니다. */
+export function openMessageSheet(sheets, { sender, when, text, trigger }) {
+  sheets.openSheet({
+    title: "전체 보기",
+    trigger,
+    buildBody: (bodyBox) => {
+      const status = el("p", { className: "field-hint", role: "status", "aria-live": "polite" });
+      const copyBtn = el(
+        "button",
+        {
+          type: "button",
+          className: "btn btn-block",
+          onClick: async () => {
+            try {
+              await navigator.clipboard.writeText(text);
+              status.textContent = "글 전체를 복사했습니다.";
+            } catch {
+              status.textContent = "자동 복사가 되지 않았습니다. 브라우저 권한을 확인해 주세요.";
+            }
+          },
+        },
+        icon("copy", "icon-sm"),
+        "전체 복사",
+      );
+      bodyBox.append(
+        el("p", { className: "field-hint", text: `${sender} · ${when}` }),
+        copyBtn, // 첫 포커스가 맨 위에 오도록 본문보다 앞에 둔다
+        status,
+        buildSafeMessageNodes(text),
+      );
+    },
+  });
+}
+
 export function openRoomCreateSheet(sheets, { trigger, onCreateRoom }) {
   sheets.openSheet({
     title: "새 방 만들기",

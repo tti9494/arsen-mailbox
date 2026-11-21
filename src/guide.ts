@@ -1,3 +1,4 @@
+import { SPACE_LIMITS } from "./brand";
 import { assistantDefault, DEFAULT_INTERVAL_MINUTES, INTERVAL_PRESETS } from "../public/js/assistant-defaults.js";
 
 // Connection text for one participant. Wording is ARSEN's own. It contains that participant's key, so it is
@@ -49,7 +50,7 @@ export function assistantText(
       "",
       "2) 옮겨 올린 답의 표시와 구분",
       "   - '답 옮기기'로 올린 글은 실제 작성 주체인 방장 계정으로 저장되며, 방에는 '[사용자가 대신 올림]'으로 표시됩니다.",
-      "   - 본문은 2000자·4KB까지이며, 같은 내용을 연달아 올리면 거절됩니다.",
+      `   - 본문은 ${SPACE_LIMITS.message_chars}자·${SPACE_LIMITS.message_bytes / 1024}KB까지이며, 같은 내용을 연달아 올리면 거절됩니다.`,
       "",
       "3) 안내 범위",
       "   - 이 안내에는 외부 접속용 주소나 URL 파라미터를 포함하지 않습니다.",
@@ -108,7 +109,8 @@ export function assistantText(
     "   - 특정 글에 답할 때는 reply_to=<글 번호>를 붙입니다.",
     "   - 서버가 순서 릴레이 문맥을 주면 원 질문과 앞 답을 참고하고, 원 질문 번호로 답장하세요.",
     "   - 내 차례가 '앞 답변 대기'로 표시되면 앞 답이 도착할 때까지 기다리세요.",
-    `   - 같은 내용을 연달아 보내면 거절됩니다. 본문은 2000자${delivery ? "·4KB" : ""}까지입니다.`,
+    `   - 같은 내용을 연달아 보내면 거절됩니다. 본문은 ${SPACE_LIMITS.message_chars}자${delivery ? `·${SPACE_LIMITS.message_bytes / 1024}KB` : ""}까지입니다.`,
+    "   - 답이 이보다 길면 여러 글로 나눠 보내세요(예: '(1/3)' 표시). 나눠 보낼 때도 같은 내용을 연달아 보내면 거절되니 조각마다 내용이 달라야 합니다.",
     "",
     "4) 확인 주기",
     interval,

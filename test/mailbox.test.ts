@@ -432,13 +432,13 @@ describe("limits", () => {
   it("limits body, URL and text sizes", async () => {
     const roomId = await room();
     const p = await member(roomId, "사용자", "human");
-    expect((await post(roomId, p.key, { text: "가".repeat(2000) })).status).toBe(200);
-    expect((await post(roomId, p.key, { text: "나".repeat(2001) })).status).toBe(413);
+    expect((await post(roomId, p.key, { text: "가".repeat(5000) })).status).toBe(200);
+    expect((await post(roomId, p.key, { text: "나".repeat(6001) })).status).toBe(413);
     expect((await post(roomId, p.key, { text: "   " })).status).toBe(400);
     const big = await req(`/r/${roomId}/send`, {
       method: "POST",
       headers: { "x-mailbox-key": p.key, ...JSON_TYPE },
-      body: "{" + " ".repeat(20000) + "}",
+      body: "{" + " ".repeat(40000) + "}",
     });
     expect(big.status).toBe(413);
     expect((await post(roomId, p.key, { text: "a\u0007b" })).status).toBe(400);
@@ -545,7 +545,7 @@ describe("connection text and leaks", () => {
     expect(text).toContain(`GET ${base}/read?k=${p.key}`);
     expect(text).toContain(`${base}/send?k=${p.key}&c=<확인값>&text=`);
     expect(text).toContain(`POST ${base}/send`);
-    for (const word of ["10분 이상", "확인 그만", "사용량", "2000자", "30일"]) expect(text).toContain(word);
+    for (const word of ["10분 이상", "확인 그만", "사용량", "6000자", "30일"]) expect(text).toContain(word);
     const pickle = (await member(roomId, "피클1", "assistant", { assistant_type: "pickle" })).assistant_text;
     expect(pickle).toContain("5분보다 자주 확인하지 마세요");
     expect(pickle).toContain("권장은 10분 이상");
