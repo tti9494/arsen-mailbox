@@ -25,18 +25,18 @@
   --chat-composer-line: var(--line-strong);
 
   --chat-bubble-other-bg: #FBF9F4;
-  --chat-bubble-other-border: #DDD5C5;
+  --chat-bubble-other-border: #E2DCCF;
   --chat-bubble-other-ink: #23221F;
   --chat-bubble-other-muted: #656057;
   --chat-bubble-other-divider: #E2DCCF;
-  --chat-bubble-other-shadow: 0 2px 6px rgba(35, 34, 31, 0.05);
+  --chat-bubble-other-shadow: none;
 
   --chat-bubble-mine-bg: #DFECEA;
-  --chat-bubble-mine-border: #2F5D62;
+  --chat-bubble-mine-border: #C5DAD6;
   --chat-bubble-mine-ink: #1A2F32;
   --chat-bubble-mine-muted: #2B4E52;
   --chat-bubble-mine-divider: #B9D3CF;
-  --chat-bubble-mine-shadow: 0 2px 6px rgba(35, 34, 31, 0.05);
+  --chat-bubble-mine-shadow: none;
 
   --chat-code-other-bg: #EAE4D7;
   --chat-code-other-border: #D7CEBE;
@@ -58,18 +58,18 @@
 
 :root[data-theme="dark"] {
   --chat-bubble-other-bg: #1E2125;
-  --chat-bubble-other-border: #2F343C;
+  --chat-bubble-other-border: #2C3036;
   --chat-bubble-other-ink: #E9E5DC;
   --chat-bubble-other-muted: #A5A096;
   --chat-bubble-other-divider: #2F343C;
-  --chat-bubble-other-shadow: 0 2px 8px rgba(10, 12, 14, 0.28);
+  --chat-bubble-other-shadow: none;
 
   --chat-bubble-mine-bg: #1E3133;
-  --chat-bubble-mine-border: #7FB3AE;
+  --chat-bubble-mine-border: #2E4B4E;
   --chat-bubble-mine-ink: #EAF4F2;
   --chat-bubble-mine-muted: #B6D8D4;
   --chat-bubble-mine-divider: #2E4B4E;
-  --chat-bubble-mine-shadow: 0 2px 8px rgba(10, 12, 14, 0.28);
+  --chat-bubble-mine-shadow: none;
 
   --chat-code-other-bg: #262A30;
   --chat-code-other-border: #363C45;
@@ -92,18 +92,18 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --chat-bubble-other-bg: #1E2125;
-    --chat-bubble-other-border: #2F343C;
+    --chat-bubble-other-border: #2C3036;
     --chat-bubble-other-ink: #E9E5DC;
     --chat-bubble-other-muted: #A5A096;
     --chat-bubble-other-divider: #2F343C;
-    --chat-bubble-other-shadow: 0 2px 8px rgba(10, 12, 14, 0.28);
+    --chat-bubble-other-shadow: none;
 
     --chat-bubble-mine-bg: #1E3133;
-    --chat-bubble-mine-border: #7FB3AE;
+    --chat-bubble-mine-border: #2E4B4E;
     --chat-bubble-mine-ink: #EAF4F2;
     --chat-bubble-mine-muted: #B6D8D4;
     --chat-bubble-mine-divider: #2E4B4E;
-    --chat-bubble-mine-shadow: 0 2px 8px rgba(10, 12, 14, 0.28);
+    --chat-bubble-mine-shadow: none;
 
     --chat-code-other-bg: #262A30;
     --chat-code-other-border: #363C45;
@@ -186,13 +186,13 @@
   --chat-composer-line: #CBC3B2;
 
   --chat-bubble-other-bg: #FBF9F4;
-  --chat-bubble-other-border: #DDD5C5;
+  --chat-bubble-other-border: #E2DCCF;
   --chat-bubble-other-ink: #23221F;
   --chat-bubble-other-muted: #656057;
   --chat-bubble-other-divider: #E2DCCF;
 
   --chat-bubble-mine-bg: #DFECEA;
-  --chat-bubble-mine-border: #2F5D62;
+  --chat-bubble-mine-border: #C5DAD6;
   --chat-bubble-mine-ink: #1A2F32;
   --chat-bubble-mine-muted: #2B4E52;
   --chat-bubble-mine-divider: #B9D3CF;
@@ -223,13 +223,13 @@
   --chat-composer-line: #3E444D;
 
   --chat-bubble-other-bg: #1E2125;
-  --chat-bubble-other-border: #2F343C;
+  --chat-bubble-other-border: #2C3036;
   --chat-bubble-other-ink: #E9E5DC;
   --chat-bubble-other-muted: #A5A096;
   --chat-bubble-other-divider: #2F343C;
 
   --chat-bubble-mine-bg: #1E3133;
-  --chat-bubble-mine-border: #7FB3AE;
+  --chat-bubble-mine-border: #2E4B4E;
   --chat-bubble-mine-ink: #EAF4F2;
   --chat-bubble-mine-muted: #B6D8D4;
   --chat-bubble-mine-divider: #2E4B4E;
@@ -261,13 +261,13 @@
     --chat-composer-line: #3E444D;
 
     --chat-bubble-other-bg: #1E2125;
-    --chat-bubble-other-border: #2F343C;
+    --chat-bubble-other-border: #2C3036;
     --chat-bubble-other-ink: #E9E5DC;
     --chat-bubble-other-muted: #A5A096;
     --chat-bubble-other-divider: #2F343C;
 
     --chat-bubble-mine-bg: #1E3133;
-    --chat-bubble-mine-border: #7FB3AE;
+    --chat-bubble-mine-border: #2E4B4E;
     --chat-bubble-mine-ink: #EAF4F2;
     --chat-bubble-mine-muted: #B6D8D4;
     --chat-bubble-mine-divider: #2E4B4E;
@@ -304,14 +304,14 @@
   --chat-bubble-other-ink: #191919;
   --chat-bubble-other-muted: #675847;
   --chat-bubble-other-divider: #E9DFD1;
-  --chat-bubble-other-shadow: 0 1px 3px rgba(20, 32, 46, 0.12);
+  --chat-bubble-other-shadow: none;
 
   --chat-bubble-mine-bg: #E6AD79;
   --chat-bubble-mine-border: #BA8353;
   --chat-bubble-mine-ink: #191919;
   --chat-bubble-mine-muted: #4E3525;
   --chat-bubble-mine-divider: #C48C60;
-  --chat-bubble-mine-shadow: 0 1px 3px rgba(20, 32, 46, 0.12);
+  --chat-bubble-mine-shadow: none;
 
   --chat-code-other-bg: #F4EBDD;
   --chat-code-other-border: #DDD0BF;
@@ -343,14 +343,14 @@
   --chat-bubble-other-ink: #FCF4EC;
   --chat-bubble-other-muted: #D6C9BC;
   --chat-bubble-other-divider: #56493D;
-  --chat-bubble-other-shadow: 0 2px 6px rgba(8, 12, 18, 0.32);
+  --chat-bubble-other-shadow: none;
 
   --chat-bubble-mine-bg: #E6AD79;
   --chat-bubble-mine-border: #B17E50;
   --chat-bubble-mine-ink: #191919;
   --chat-bubble-mine-muted: #4E3525;
   --chat-bubble-mine-divider: #BF885A;
-  --chat-bubble-mine-shadow: 0 2px 6px rgba(8, 12, 18, 0.32);
+  --chat-bubble-mine-shadow: none;
 
   --chat-code-other-bg: #29231E;
   --chat-code-other-border: #5C4C40;
@@ -383,14 +383,14 @@
     --chat-bubble-other-ink: #FCF4EC;
     --chat-bubble-other-muted: #D6C9BC;
     --chat-bubble-other-divider: #56493D;
-    --chat-bubble-other-shadow: 0 2px 6px rgba(8, 12, 18, 0.32);
+    --chat-bubble-other-shadow: none;
 
     --chat-bubble-mine-bg: #E6AD79;
     --chat-bubble-mine-border: #B17E50;
     --chat-bubble-mine-ink: #191919;
     --chat-bubble-mine-muted: #4E3525;
     --chat-bubble-mine-divider: #BF885A;
-    --chat-bubble-mine-shadow: 0 2px 6px rgba(8, 12, 18, 0.32);
+    --chat-bubble-mine-shadow: none;
 
     --chat-code-other-bg: #29231E;
     --chat-code-other-border: #5C4C40;
@@ -679,14 +679,14 @@
   --chat-bubble-other-ink: #18271F;
   --chat-bubble-other-muted: #4A6356;
   --chat-bubble-other-divider: #D6E6DD;
-  --chat-bubble-other-shadow: 0 2px 6px rgba(24, 48, 36, 0.06);
+  --chat-bubble-other-shadow: none;
 
   --chat-bubble-mine-bg: #CCE5D7;
   --chat-bubble-mine-border: #2D6A4F;
   --chat-bubble-mine-ink: #13261C;
   --chat-bubble-mine-muted: #274D3B;
   --chat-bubble-mine-divider: #A7CEB9;
-  --chat-bubble-mine-shadow: 0 2px 6px rgba(24, 48, 36, 0.06);
+  --chat-bubble-mine-shadow: none;
 
   --chat-code-other-bg: #EBF4EF;
   --chat-code-other-border: #C4DACE;
@@ -718,14 +718,14 @@
   --chat-bubble-other-ink: #E5F0EA;
   --chat-bubble-other-muted: #A2BDAD;
   --chat-bubble-other-divider: #2C4238;
-  --chat-bubble-other-shadow: 0 2px 8px rgba(6, 12, 9, 0.32);
+  --chat-bubble-other-shadow: none;
 
   --chat-bubble-mine-bg: #1E3B30;
   --chat-bubble-mine-border: #52B788;
   --chat-bubble-mine-ink: #EAF7F0;
   --chat-bubble-mine-muted: #B7DEC9;
   --chat-bubble-mine-divider: #2E5747;
-  --chat-bubble-mine-shadow: 0 2px 8px rgba(6, 12, 9, 0.32);
+  --chat-bubble-mine-shadow: none;
 
   --chat-code-other-bg: #141F1A;
   --chat-code-other-border: #2D4339;
@@ -758,14 +758,14 @@
     --chat-bubble-other-ink: #E5F0EA;
     --chat-bubble-other-muted: #A2BDAD;
     --chat-bubble-other-divider: #2C4238;
-    --chat-bubble-other-shadow: 0 2px 8px rgba(6, 12, 9, 0.32);
+    --chat-bubble-other-shadow: none;
 
     --chat-bubble-mine-bg: #1E3B30;
     --chat-bubble-mine-border: #52B788;
     --chat-bubble-mine-ink: #EAF7F0;
     --chat-bubble-mine-muted: #B7DEC9;
     --chat-bubble-mine-divider: #2E5747;
-    --chat-bubble-mine-shadow: 0 2px 8px rgba(6, 12, 9, 0.32);
+    --chat-bubble-mine-shadow: none;
 
     --chat-code-other-bg: #141F1A;
     --chat-code-other-border: #2D4339;
@@ -872,13 +872,13 @@
 .chat-pane .msg-reply-ref,
 .chat-skin-preview .msg-reply-ref {
   color: var(--chat-bubble-other-muted);
-  border-bottom-color: var(--chat-bubble-other-divider);
+  border-left-color: var(--chat-bubble-other-divider);
 }
 
 .chat-pane .msg-row.is-mine .msg-reply-ref,
 .chat-skin-preview .msg-row.is-mine .msg-reply-ref {
   color: var(--chat-bubble-mine-muted);
-  border-bottom-color: var(--chat-bubble-mine-divider);
+  border-left-color: var(--chat-bubble-mine-divider);
 }
 
 .chat-pane .msg-code,
@@ -1384,7 +1384,7 @@
   padding-top: var(--sp-1);
 }
 
-@media (max-width: 768px) {
+@media (max-width: 960px), (max-height: 500px) and (max-width: 1100px) {
   .sheet-panel:has(.chat-settings-root) {
     max-width: 100%;
   }

@@ -82,9 +82,12 @@ const ICON_PATHS = {
     ["path", { d: "M12 5V19" }],
     ["path", { d: "M5 12H19" }],
   ],
+  // 해 모양 대신 조절 슬라이더: 테마 전환 버튼으로 오해되지 않게 한다.
   settings: [
-    ["circle", { cx: 12, cy: 12, r: 3.2 }],
-    ["path", { d: "M12 3V5.2M12 18.8V21M3 12H5.2M18.8 12H21M5.6 5.6L7.2 7.2M16.8 16.8L18.4 18.4M18.4 5.6L16.8 7.2M7.2 16.8L5.6 18.4" }],
+    ["path", { d: "M4 7H7M11 7H20M4 12H13M17 12H20M4 17H6M10 17H20" }],
+    ["circle", { cx: 9, cy: 7, r: 2 }],
+    ["circle", { cx: 15, cy: 12, r: 2 }],
+    ["circle", { cx: 8, cy: 17, r: 2 }],
   ],
   users: [
     ["circle", { cx: 9, cy: 8.5, r: 3 }],
@@ -103,6 +106,10 @@ const ICON_PATHS = {
   relay: [
     ["path", { d: "M4 8H18L14.5 4.5" }],
     ["path", { d: "M20 16H6L9.5 19.5" }],
+  ],
+  reply: [
+    ["path", { d: "M9 14L4 9L9 4" }],
+    ["path", { d: "M20 20V13C20 11.3 18.7 10 17 10H4" }],
   ],
   copy: [
     ["rect", { x: 9, y: 9, width: 11, height: 11, rx: 2 }],
