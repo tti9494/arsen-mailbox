@@ -35,7 +35,7 @@ const SECURITY_HEADERS = {
   "x-robots-tag": "noindex, nofollow, noarchive",
   "x-frame-options": "DENY",
   "content-security-policy":
-    "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'",
+    "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com; img-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'",
 };
 
 const store = createMockStore(`http://${HOST}:${PORT}`);

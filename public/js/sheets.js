@@ -1249,7 +1249,6 @@ export function openRelaySheet(
     imageUploads = false,
     imageMaxBytes,
     imageMaxEdge,
-    requiresImage = () => false,
     onOpenAdd,
   },
 ) {
@@ -1367,10 +1366,8 @@ export function openRelaySheet(
             e.preventDefault();
             if (sending || imagePicker?.working) return;
             const checkErr = validateMessageInput(answerArea.value);
-            if (checkErr || !draft && (!answerArea.value.trim() || requiresImage(aiSelect.value))) {
-              errLine.textContent = checkErr || (requiresImage(aiSelect.value)
-                ? "이 비서 이름으로 옮길 때는 이미지를 붙여 주세요."
-                : "옮길 답을 쓰거나 이미지를 붙여 주세요.");
+            if (checkErr || !draft && !answerArea.value.trim()) {
+              errLine.textContent = checkErr || "옮길 답을 쓰거나 이미지를 붙여 주세요.";
               errLine.hidden = false;
               return;
             }

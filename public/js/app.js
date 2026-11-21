@@ -1369,7 +1369,7 @@ function syncDynamicConversationUI() {
   if (membersContainer) renderDesktopMembersList(membersContainer);
   const relayButton = document.getElementById("manual-relay-action");
   composerPicker?.refresh();
-  if (relayButton) relayButton.hidden = !currentParticipants().some((p) => canRelayFor(p) || canRelayImageFor(p));
+  if (relayButton) relayButton.hidden = !currentParticipants().some((p) => canRelayFor(p));
   if (guestHeading) guestHeading.textContent = state.guestMeta.roomName || "초대받은 방";
   if (guestIdentity) {
     guestIdentity.hidden = !state.guestMeta.meName;
@@ -1701,10 +1701,6 @@ function canRelayFor(participant, directlyAddressed = false) {
     (kindMeta(participant).manualRelayOnly || (directlyAddressed && participant.status === "created"));
 }
 
-function canRelayImageFor(participant) {
-  return state.imageUploads && participant?.kind === "assistant" && !participant.revoked;
-}
-
 function buildQuestionStatus(message, isGuest) {
   const targets = [...(state.questions.get(message.id)?.values() ?? [])]
     .sort((a, b) => (a.step ?? 0) - (b.step ?? 0));
@@ -1838,7 +1834,7 @@ async function triggerRelayForParticipant(initialParticipantId = null, trigger =
   }
   if (session !== state.sessionGen || view !== state.roomGen) return;
   const eligible = currentParticipants().filter((p) =>
-    (canRelayFor(p, question?.direct) || canRelayImageFor(p)) &&
+    canRelayFor(p, question?.direct) &&
     (initialParticipantId === null || p.participant_id === initialParticipantId));
   if (!eligible.length) return;
   openRelaySheet(sheets, {
@@ -1858,7 +1854,6 @@ async function triggerRelayForParticipant(initialParticipantId = null, trigger =
     imageUploads: state.imageUploads,
     imageMaxBytes: state.imageMaxBytes,
     imageMaxEdge: state.imageMaxEdge,
-    requiresImage: (pid) => !eligible.some((p) => p.participant_id === pid && canRelayFor(p, question?.direct)),
     onPostRelayed: async ({ relayedFor, text, image }) => {
       if (session !== state.sessionGen || view !== state.roomGen) return;
       const spaceKey = getSpaceKey();
@@ -2143,7 +2138,7 @@ function buildComposer({ isGuest }) {
           type: "button",
           className: "btn",
           id: "manual-relay-action",
-          hidden: !currentParticipants().some((p) => canRelayFor(p) || canRelayImageFor(p)),
+          hidden: !currentParticipants().some((p) => canRelayFor(p)),
           title: "답 옮기기 (AI 대신 올림)",
           "aria-label": "AI 답 옮기기",
           onClick: (e) => triggerRelayForParticipant(null, e.currentTarget),

@@ -73,7 +73,7 @@ npx wrangler dev --config src/wrangler.local.jsonc --local --ip 127.0.0.1 --port
 
 ## 이미지 첨부
 
-`IMAGE_UPLOADS` 기본값은 `off`입니다. 0015 적용 뒤 필요하면 `on`을 설정하세요. 기본값은 PNG·JPEG·WebP 정지 이미지 48,000바이트·긴 변 2048px, 공간당 하루 10장입니다. 화면에서 크기를 줄여 올릴 수 있습니다. 헤더 방식 비서는 참가자 열쇠를 사용해 `POST /r/{room}/image`에 바이트를 보내거나 `POST /r/{room}/send`에 JSON으로 보낼 수 있습니다. 직접 올리는 JPEG는 방향을 미리 적용하세요. 주소 방식 비서의 이미지는 방장이 ‘답 옮기기’로 올릴 수 있습니다. 내보내기는 파일 대신 첨부 정보만 담습니다.
+`IMAGE_UPLOADS` 기본값은 `off`입니다. 0015 적용 뒤 필요하면 `on`을 설정하세요. 기본값은 PNG·JPEG·WebP 정지 이미지 48,000바이트·긴 변 2048px, 공간당 하루 10장입니다. 화면에서 크기를 줄여 올릴 수 있습니다. 헤더 방식 비서는 참가자 열쇠를 사용해 `POST /r/{room}/image`에 바이트를 보내거나 `POST /r/{room}/send`에 JSON으로 보낼 수 있습니다. 직접 올리는 JPEG는 방향을 미리 적용하세요. 직접 옮기기 전용 비서의 이미지는 방장이 ‘답 옮기기’로 올릴 수 있습니다. 내보내기는 파일 대신 첨부 정보만 담습니다.
 
 운영자는 `IMAGE_MAX_BYTES`, `IMAGE_MAX_EDGE`, `IMAGE_SPACE_DAILY`, `IMAGE_SITE_DAILY`, `IMAGE_SPACE_BYTES`, `IMAGE_SITE_BYTES`를 설정할 수 있습니다. 한도를 높이면 Worker CPU와 브라우저 메모리 사용이 늘어날 수 있습니다. 올리기를 꺼도 기존 첨부 조회와 삭제는 가능합니다.
 
