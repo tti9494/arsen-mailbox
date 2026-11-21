@@ -24,6 +24,7 @@ import {
   appendNodes,
   buildAvatar,
   buildLiveScheduleNode,
+  buildSafeMessageNodes,
   buildSafeTranscript,
   clearNode,
   describeAssistantSchedule,
@@ -1435,6 +1436,53 @@ export function openRelaySheet(
         form.insertBefore(imagePicker.status, errLine);
       }
       bodyBox.appendChild(form);
+    },
+  });
+}
+
+export function openMessageSheet(sheets, { messageId, sender, when, text, relayed, hasImage, trigger }) {
+  sheets.openSheet({
+    title: "전체 보기",
+    trigger,
+    buildBody: (bodyBox) => {
+      const content = buildSafeMessageNodes(text);
+      content.classList.add("message-full-text");
+      content.dataset.messageId = String(messageId);
+      const status = el("div", { className: "field-hint", role: "status" });
+      const copyBtn = el("button", {
+        type: "button",
+        className: "btn btn-block",
+        onClick: async () => {
+          try {
+            await navigator.clipboard.writeText(text);
+            status.textContent = "글 전체를 복사했습니다.";
+          } catch {
+            status.textContent = "복사할 수 없습니다. 본문을 선택해 복사해 주세요.";
+          }
+        },
+      }, icon("copy", "icon-sm"), "전체 복사");
+
+      bodyBox.append(
+        el("p", {
+          className: "field-hint message-full-meta",
+          text: [sender, relayed ? "사용자가 대신 올림" : "", when].filter(Boolean).join(" · "),
+        }),
+        ...(hasImage ? [el("p", { className: "field-hint message-full-meta", text: "첨부 이미지는 대화에서 볼 수 있습니다." })] : []),
+        el("div", {}, copyBtn, status),
+        content,
+      );
+
+      const panel = bodyBox.closest("[role=dialog]");
+      panel.addEventListener("keydown", (event) => {
+        if (event.key !== "Tab") return;
+        const controls = [...panel.querySelectorAll("button:not(:disabled), a[href]")];
+        const first = controls[0];
+        const last = controls.at(-1);
+        if (document.activeElement === (event.shiftKey ? first : last)) {
+          event.preventDefault();
+          (event.shiftKey ? last : first).focus();
+        }
+      });
     },
   });
 }

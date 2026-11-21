@@ -1300,6 +1300,15 @@ label {
   gap: var(--sp-4);
 }
 
+.message-full-meta {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.message-full-text {
+  min-width: 0;
+}
+
 /* 참가자 종류 카드 12종 (자주 쓰는 비서 상단 그리드 · 화면 6) */
 .kind-grid {
   display: grid;

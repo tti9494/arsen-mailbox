@@ -23,7 +23,7 @@ const runtime = new Miniflare(convertV4MiniflareOptions({
   port: 0,
   logRequests: false,
   unsafeRegisterWorker: false,
-  bindings: vars,
+  bindings: process.argv.includes("--images") ? { ...vars, IMAGE_UPLOADS: "on" } : vars,
   d1Databases: ["DB"],
   assets: {
     directory: resolve("src", assets.directory),
