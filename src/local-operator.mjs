@@ -19,7 +19,7 @@ export function localDB(state) {
 export async function privateWrite(output, data) {
   if (!output || !isAbsolute(output)) throw Error("absolute output required");
   const dir = await realpath(dirname(output));
-  const outside = relative(fileURLToPath(new URL("../../", import.meta.url)), dir);
+  const outside = relative(fileURLToPath(new URL("../", import.meta.url)), dir);
   if (!(outside === ".." || outside.startsWith("../")) || (await stat(dir)).mode & 0o077)
     throw Error("private directory required");
   const file = await open(output, "wx", 0o600);

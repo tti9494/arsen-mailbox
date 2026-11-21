@@ -19,7 +19,6 @@ export function spaceDailyWriteLimit(value?: string) {
   if (!input || !/^[+-]?\d+$/.test(input)) return DEFAULT_SPACE_DAILY_WRITE_LIMIT;
   return Math.min(30_000, Math.max(1_000, Number(input)));
 }
-export const FEEDBACK_WRITE_WEIGHT = 12;
 export const DAILY_CAPACITY_NOTICE = "오늘 우편함 사용량 한도에 도달했습니다. UTC 자정(한국 시각 오전 9시) 이후 다시 시도해 주세요.";
 
 export class DailyCapacity extends Refused {

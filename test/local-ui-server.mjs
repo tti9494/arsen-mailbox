@@ -1,4 +1,4 @@
-// Run from mailbox-worker with a path in a private temporary directory.
+// Run from the repository root with a path in a private temporary directory.
 // The HTTP server is the real Worker and D1 under workerd. Only Siteverify is replaced.
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
