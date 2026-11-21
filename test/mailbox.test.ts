@@ -16,6 +16,59 @@ const BASE = "https://mailbox.example.test";
 const UA = { "user-agent": "test-assistant/1.0" };
 const JSON_TYPE = { "content-type": "application/json" };
 
+it("enforces HTTPS only on the configured public address before any route can touch D1", async () => {
+  const configured = { ...env, PUBLIC_BASE_URL: BASE };
+  const noDatabase = { ...configured, get DB(): typeof env.DB { throw new Error("HTTP reached D1"); } };
+  const insecure = "http://mailbox.example.test";
+  const readPath = "/r/fixture/read";
+  for (const method of ["GET", "HEAD"]) {
+    const request = new Request(insecure + readPath + "?k=synthetic", {
+      method, headers: { "X-Mailbox-Key": "synthetic" },
+    });
+    const response = await worker.fetch(request, noDatabase);
+    expect(response.status).toBe(308);
+    expect(response.headers.get("location")).toBe(BASE + readPath);
+    expect(response.headers.get("strict-transport-security")).toBeNull();
+    expect(await response.text()).toBe("");
+  }
+  for (const method of ["POST", "OPTIONS"]) {
+    const refused = await worker.fetch(new Request(insecure + "/api/spaces?fixture=synthetic", {
+      method, headers: { authorization: "Bearer synthetic" }, body: method === "POST" ? "synthetic" : undefined,
+    }), noDatabase);
+    expect(refused.status).toBe(403);
+    expect(refused.headers.get("location")).toBeNull();
+    expect(refused.headers.get("strict-transport-security")).toBeNull();
+    expect(await refused.text()).toBe("error: https_required\n");
+  }
+
+  const health = await worker.fetch(new Request(BASE + "/healthz"), configured);
+  expect(health.status).toBe(200);
+  expect(health.headers.get("strict-transport-security")).toBe("max-age=15552000");
+  const unauthorized = await worker.fetch(new Request(BASE + readPath), configured);
+  expect(unauthorized.status).toBe(401);
+  expect(unauthorized.headers.get("strict-transport-security")).toBe("max-age=15552000");
+  const assetPath = BASE + "/css/styles.css";
+  const asset = await worker.fetch(new Request(assetPath), {
+    ...configured,
+    ASSETS: {
+      fetch: async (input: RequestInfo | URL) => {
+        expect(input).toBeInstanceOf(Request);
+        expect((input as Request).url).toBe(assetPath);
+        return new Response("body {}", { headers: { "content-type": "text/css" } });
+      },
+      connect: () => { throw new Error("Static asset request opened an unexpected socket"); },
+    },
+  });
+  expect(asset.status).toBe(200);
+  expect(asset.headers.get("strict-transport-security")).toBe("max-age=15552000");
+  expect(await asset.text()).toBe("body {}");
+  for (const origin of ["https://other.example.test", "http://127.0.0.1:8830"]) {
+    const response = await worker.fetch(new Request(origin + "/healthz"), configured);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("strict-transport-security")).toBeNull();
+  }
+});
+
 type Init = { method?: string; headers?: Record<string, string>; body?: BodyInit };
 
 function req(path: string, init: Init = {}): Promise<Response> {
@@ -274,6 +327,10 @@ describe("reading", () => {
     const first = ((await (await post(roomId, human.key, { text: "안녕\n둘째 줄" })).json()) as { id: number }).id;
     const text = await (await read(roomId, bot.key)).text();
     expect(text.startsWith("# ARSEN 우편함 v1\n# 방: 가족방\n# 나: 부이1 (비서)\n")).toBe(true);
+    expect(text).toMatch(/^# 보내기 확인값: amt_[A-Za-z0-9_-]+$/m);
+    expect(text).toMatch(/^# 쓰기 안내: .*\/read.*\/send.*k.*c=확인값.*text=/m);
+    expect(text).toContain(`# 확인값은 ${TICKET_SECONDS / 60}분 안에 한 번 쓰며`);
+    expect(text).not.toContain(bot.key);
     expect(text).toContain("# 새 글: 1개");
     expect(text).toContain(`# 다음 since: ${first}`);
     expect(text).toMatch(new RegExp(`\\[${first}\\] \\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2} 사용자\\(사람\\)\\n    안녕\\n    둘째 줄\\n---\\n$`));
@@ -410,7 +467,7 @@ describe("limits", () => {
     expect(limited.status).toBe(429);
     expect(await limited.text()).toContain("rate_limited");
     expect((await read(roomId, b.key)).status).toBe(200); // another key is unaffected
-    await env.DB.exec("UPDATE rate_hits SET window_start = window_start - 60"); // the minute passes
+    await env.DB.exec("UPDATE participants SET read_minute=read_minute-60"); // the minute passes
     expect((await read(roomId, a.key)).status).toBe(200);
     const [sends] = LIMITS.send;
     for (let i = 0; i < sends; i++) expect((await post(roomId, b.key, { text: `글 ${i}` })).status).toBe(200);
@@ -419,6 +476,7 @@ describe("limits", () => {
 
   it("rate-limits failed keys per source address", async () => {
     const roomId = await room();
+    vi.spyOn(Date, "now").mockReturnValue(Math.floor(Date.now() / 60_000) * 60_000 + 15_000);
     const [fails] = LIMITS.auth_fail;
     const from = (ip: string) => ({ "cf-connecting-ip": ip });
     for (let i = 0; i < fails; i++) {
@@ -432,13 +490,13 @@ describe("limits", () => {
   it("limits body, URL and text sizes", async () => {
     const roomId = await room();
     const p = await member(roomId, "사용자", "human");
-    expect((await post(roomId, p.key, { text: "가".repeat(5000) })).status).toBe(200);
-    expect((await post(roomId, p.key, { text: "나".repeat(6001) })).status).toBe(413);
+    expect((await post(roomId, p.key, { text: "가".repeat(2000) })).status).toBe(200);
+    expect((await post(roomId, p.key, { text: "나".repeat(2001) })).status).toBe(413);
     expect((await post(roomId, p.key, { text: "   " })).status).toBe(400);
     const big = await req(`/r/${roomId}/send`, {
       method: "POST",
       headers: { "x-mailbox-key": p.key, ...JSON_TYPE },
-      body: "{" + " ".repeat(40000) + "}",
+      body: "{" + " ".repeat(20000) + "}",
     });
     expect(big.status).toBe(413);
     expect((await post(roomId, p.key, { text: "a\u0007b" })).status).toBe(400);
@@ -545,7 +603,7 @@ describe("connection text and leaks", () => {
     expect(text).toContain(`GET ${base}/read?k=${p.key}`);
     expect(text).toContain(`${base}/send?k=${p.key}&c=<확인값>&text=`);
     expect(text).toContain(`POST ${base}/send`);
-    for (const word of ["10분 이상", "확인 그만", "사용량", "6000자", "30일"]) expect(text).toContain(word);
+    for (const word of ["10분 이상", "확인 그만", "사용량", "2000자", "30일"]) expect(text).toContain(word);
     const pickle = (await member(roomId, "피클1", "assistant", { assistant_type: "pickle" })).assistant_text;
     expect(pickle).toContain("5분보다 자주 확인하지 마세요");
     expect(pickle).toContain("권장은 10분 이상");

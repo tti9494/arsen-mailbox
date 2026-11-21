@@ -1,5 +1,5 @@
-import { initTheme } from "./theme.js?v=2.2.2";
-import { buildPwaIllustration, buildThemeSelector } from "./dom.js?v=2.2.2";
+import { initTheme } from "./theme.js?v=2.3.0";
+import { buildPwaIllustration, buildThemeSelector } from "./dom.js?v=2.3.0";
 
 initTheme();
 

@@ -3,9 +3,9 @@
 // - 비민감 표시·입력·알림 설정만 localStorage('arsen.mailbox.v2.chat_prefs')에 보관 (열쇠·토큰 저장 금지)
 // - 브라우저 알림 권한(Notification.requestPermission)은 오직 사용자가 토글을 켤 때만 요청
 
-import { errorMessage, validateNameInput } from "./constants.js?v=2.2.2";
-import { appendNodes, buildAvatar, el, icon } from "./dom.js?v=2.2.2";
-import { applyTheme, getThemeMode, onThemeChange } from "./theme.js?v=2.2.2";
+import { errorMessage, validateNameInput } from "./constants.js?v=2.3.0";
+import { appendNodes, buildAvatar, el, icon } from "./dom.js?v=2.3.0";
+import { applyTheme, getThemeMode, onThemeChange } from "./theme.js?v=2.3.0";
 
 const CHAT_PREFS_STORAGE_KEY = "arsen.mailbox.v2.chat_prefs";
 const THEME_STORAGE_KEY = "arsen.mailbox.v2.theme";

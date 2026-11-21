@@ -1,6 +1,5 @@
-import { assistantDefault, DEFAULT_INTERVAL_MINUTES } from "./assistant-defaults.js?v=2.2.2";
-import { MAX_SEND_CHUNKS, splitProblem } from "./message-split.js?v=2.2.2";
-export { DEFAULT_INTERVAL_MINUTES, INTERVAL_PRESETS } from "./assistant-defaults.js?v=2.2.2";
+import { assistantDefault, DEFAULT_INTERVAL_MINUTES } from "./assistant-defaults.js?v=2.3.0";
+export { DEFAULT_INTERVAL_MINUTES, INTERVAL_PRESETS } from "./assistant-defaults.js?v=2.3.0";
 
 // 브랜드 상수·한도·참가자 종류·검증 규칙 (src/brand.ts 및 src/policy.ts 정합)
 
@@ -11,8 +10,8 @@ export const SPACE_LIMITS = Object.freeze({
   rooms: 5,
   participants: 8,
   messages_per_day: 500,
-  message_bytes: 16384,
-  max_chars: 6000,
+  message_bytes: 4096,
+  max_chars: 2000,
   retention_days: 30,
   assistant_read_seconds: 30,
 });
@@ -20,7 +19,9 @@ export const SPACE_LIMITS = Object.freeze({
 export const RETENTION_SECONDS = SPACE_LIMITS.retention_days * 86400;
 export const MAX_INTERVAL_MINUTES = SPACE_LIMITS.retention_days * 1440;
 export const POLL_ACTIVE_MS = 5000;
-export const POLL_IDLE_MS = 20000;
+export const POLL_IDLE_MS = 60_000;
+export const POLL_OVERVIEW_ACTIVE_MS = 20_000;
+export const POLL_OVERVIEW_IDLE_MS = 300_000;
 export const IDLE_THRESHOLD_MS = 30000;
 
 // 확정 거절 시 방의 본문과 복사 버퍼를 즉시 비운다(client_mailbox.js r2 규칙 계승).
@@ -272,6 +273,10 @@ export const ERROR_MESSAGES = {
   forbidden: "이 열쇠로는 접근할 수 없거나 사람 확인에 실패했습니다.",
   rate_limited: "빈 확인 반복 제한(30초) 또는 요청 한도에 걸렸습니다. 잠시 뒤에 다시 시도해 주세요.",
   quota: "공간의 방, 참가자 또는 일일 글 상한에 도달했습니다.",
+  space_operation_quota: "이 작업 한 건이 공간의 하루 처리 한도를 넘습니다. 참가자 폐기는 나눠서 진행하고, 큰 방 삭제는 운영자에게 문의해 주세요.",
+  space_posts_quota: "이 공간의 하루 글 상한에 도달했습니다. 한국 시각 오전 9시 이후 다시 시도해 주세요.",
+  space_day_quota: "이 공간의 오늘 사용량 한도에 도달했습니다. UTC 자정(한국 시각 오전 9시) 이후 다시 시도해 주세요.",
+  service_day_quota: "오늘 우편함 사용량 한도에 도달했습니다. UTC 자정(한국 시각 오전 9시) 이후 다시 시도해 주세요.",
   not_found: "요청한 방이나 대상을 찾을 수 없습니다.",
   invalid: "입력 형식을 확인해 주세요. 민감 정보나 허용되지 않는 문자는 보낼 수 없습니다.",
   question_ambiguous: "받을 비서를 구분할 수 없습니다. 방에 표시된 정확한 이름을 사용하세요.",
@@ -280,14 +285,29 @@ export const ERROR_MESSAGES = {
   signup_closed: "지금은 새 공간 가입이 일시 중지되어 있습니다. 잠시 뒤 다시 확인해 주세요.",
   key_epoch_invalid: "서버 열쇠 세대가 갱신되어 열쇠를 다시 발급받아야 합니다.",
   text_sensitive: "비밀번호·인증번호·열쇠처럼 보이는 내용은 보낼 수 없습니다.",
-  text_too_long: "글이 너무 깁니다(최대 6,000자 · 16KB 이내). 나눠서 보내 주세요.",
-  text_too_long_total: "글이 너무 깁니다. 나눠 보내도 글 5개(약 2만 7천자)를 넘을 수 없어요.",
+  image_invalid: "이미지 파일을 열 수 없습니다. 다른 파일로 다시 시도해 주세요.",
+  image_unsupported: "정지 PNG·JPEG·WebP 이미지만 올릴 수 있습니다.",
+  image_too_large: "이 방에 올릴 수 있는 이미지 크기 한도를 넘었습니다.",
+  image_dimensions: "이미지의 가로 또는 세로가 한도를 넘었습니다.",
+  image_disabled: "이미지 올리기가 일시적으로 꺼져 있습니다.",
+  image_site_storage: "우편함의 이미지 저장 한도에 도달했습니다.",
+  image_space_storage: "이 공간의 이미지 저장 한도에 도달했습니다.",
+  image_site_daily: "오늘 우편함의 이미지 올리기 한도에 도달했습니다. 한국 시각 오전 9시 이후 다시 시도해 주세요.",
+  image_space_daily: "오늘 이 공간의 이미지 올리기 한도에 도달했습니다. 한국 시각 오전 9시 이후 다시 시도해 주세요.",
+  image_participant_minute: "이미지를 너무 자주 올렸습니다. 잠시 뒤 다시 시도해 주세요.",
+  text_too_long: "글이 너무 깁니다(최대 2,000자 · 4KB 이내).",
   offline: "오프라인 상태입니다. 인터넷 연결이 돌아오면 자동으로 다시 읽습니다.",
   network: "서버에 연결하지 못했습니다. 잠시 뒤 다시 시도해 주세요.",
 };
 
 export function errorMessage(err) {
   const code = err?.code || "";
+  if (code === "space_posts_quota" && Number.isSafeInteger(err?.postLimit))
+    return `이 공간의 하루 글 상한(${err.postLimit}건)에 도달했습니다. 한국 시각 오전 9시 이후 다시 시도해 주세요.`;
+  if (code === "image_too_large" && Number.isSafeInteger(err?.imageMaxBytes))
+    return "이미지는 한 장에 최대 " + err.imageMaxBytes.toLocaleString("ko-KR") + "바이트까지 올릴 수 있습니다.";
+  if (code === "image_dimensions" && Number.isSafeInteger(err?.imageMaxEdge))
+    return "이미지는 가로와 세로 각각 " + err.imageMaxEdge.toLocaleString("ko-KR") + "px까지 올릴 수 있습니다.";
   if (code === "rate_limited" && Number.isFinite(err?.retryAfter) && err.retryAfter > 0) {
     return `요청 간격 제한 중입니다. 약 ${err.retryAfter}초 뒤에 다시 시도해 주세요.`;
   }
@@ -296,21 +316,14 @@ export function errorMessage(err) {
 
 const utf8Encoder = new TextEncoder();
 
-/** `split: true`는 입력창용: 글 1건 한도를 넘어도 MAX_SEND_CHUNKS건 안에서 나눠 보낼 수 있으면 통과합니다. */
-export function validateMessageInput(raw, { split = false } = {}) {
+export function validateMessageInput(raw) {
   if (typeof raw !== "string") return "보낼 내용을 입력해 주세요.";
   const normalized = raw.replace(/\r\n?/g, "\n").normalize("NFC");
   if (CONTROL_PATTERN.test(normalized)) return "본문에 쓸 수 없는 제어 문자가 포함되어 있습니다.";
   const trimmed = normalized.trim();
   if (!trimmed) return "";
-  if (split) {
-    if ([...trimmed].length > SPACE_LIMITS.max_chars * MAX_SEND_CHUNKS || splitProblem(trimmed)) {
-      return ERROR_MESSAGES.text_too_long_total;
-    }
-  } else {
-    if ([...trimmed].length > SPACE_LIMITS.max_chars) return ERROR_MESSAGES.text_too_long;
-    if (utf8Encoder.encode(trimmed).byteLength > SPACE_LIMITS.message_bytes) return ERROR_MESSAGES.text_too_long;
-  }
+  if ([...trimmed].length > SPACE_LIMITS.max_chars) return ERROR_MESSAGES.text_too_long;
+  if (utf8Encoder.encode(trimmed).byteLength > SPACE_LIMITS.message_bytes) return ERROR_MESSAGES.text_too_long;
   if (SENSITIVE_PATTERN.test(trimmed)) return ERROR_MESSAGES.text_sensitive;
   return "";
 }

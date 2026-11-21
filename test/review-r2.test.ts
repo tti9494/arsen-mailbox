@@ -229,7 +229,7 @@ describe("P2 fixes", () => {
     const p = await addMember(env, env.TEST_OWNER_KEY, roomId, "부이1");
     const [reads] = LIMITS.read;
     for (let i = 0; i < reads + 3; i++) await call(env, `/r/${roomId}/read?k=${enc(p.key)}`);
-    const row = await env.DB.prepare("SELECT count FROM rate_hits WHERE bucket = 'read' AND subject = ?")
+    const row = await env.DB.prepare("SELECT read_count AS count FROM participants WHERE id = ?")
       .bind(p.participant_id)
       .first<{ count: number }>();
     expect(row?.count).toBe(reads);

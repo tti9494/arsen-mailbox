@@ -1,10 +1,12 @@
 import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker, { newKey, purge, sourceOf, sha256hex, type Env } from "../src/app";
-import { dayStart } from "../src/budget";
-import { SPACE_LIMITS } from "../src/brand";
+import { dayStart, readWriteEstimate } from "../src/budget";
+import { LIMITS } from "../src/policy";
+import { SIGNUP_WRITE_WEIGHT, SLOW_READS, DEFAULT_SPACE_DAILY_WRITE_LIMIT, STOP_MUTATIONS, STOP_TRAFFIC } from "../src/budget";
+import { MAX_DAILY_POST_LIMIT, SPACE_LIMITS } from "../src/brand";
 import { migrateOwnerRows } from "../src/migrate-owner-rows";
-import type { QuestionState, RelayTurn } from "../src/questions";
+import { routeQuestion, type QuestionState, type RelayTurn } from "../src/questions";
 
 const local = {
   ...env,
@@ -44,6 +46,7 @@ type Reply = {
   avatars: { revision: string; webp: string }[];
   chunk: string;
   next: number;
+  previous: number | null;
   until: number;
   more: boolean;
   policy: string;
@@ -215,14 +218,15 @@ describe("space admission and credentials", () => {
     await denied(signup(), 403, "forbidden");
     expect(await db.prepare("SELECT SUM(used) FROM invite_codes").first("SUM(used)")).toBe(0);
   });
-  it("enforces source/day, invite uses and 70% estimated D1 write budget transactionally", async () => {
+  it("enforces source/day, invite uses and the estimated D1 write budget transactionally", async () => {
     const results = await Promise.all(Array.from({ length: 4 }, () => signup()));
     expect(results.map((r) => r.status).sort()).toEqual([200, 200, 200, 429]);
     await db
-      .prepare("UPDATE rate_hits SET count=? WHERE bucket='estimated_writes'")
-      .bind(SPACE_LIMITS.signup_stop_writes - 1)
+      .prepare("INSERT INTO rate_hits(bucket,subject,window_start,count) VALUES('estimated_writes','all',?,?)" +
+        " ON CONFLICT(bucket,subject,window_start) DO UPDATE SET count=excluded.count")
+      .bind(dayStart(), SPACE_LIMITS.signup_stop_writes - 1)
       .run();
-    await denied(signup(), 503, "signup_closed");
+    await denied(signup(), 429, "quota");
     await db.prepare("DELETE FROM spaces").run();
     await db.prepare("DELETE FROM rate_hits").run();
     await db.prepare("UPDATE invite_codes SET max_uses=used+1").run();
@@ -382,7 +386,7 @@ describe("rooms, participants and messages", () => {
         (p) => p.participant_id === a.participant_id,
       )?.status,
     ).toBe("connected");
-    await db.prepare("UPDATE participants SET last_read_at=unixepoch()-301 WHERE id=?").bind(a.participant_id).run();
+    await db.prepare("UPDATE participants SET last_read_at=unixepoch()-301,read_guard_at=unixepoch()-301 WHERE id=?").bind(a.participant_id).run();
     expect(
       (await ok(call(path + "/participants", "GET", s.key))).participants.find(
         (p) => p.participant_id === a.participant_id,
@@ -422,21 +426,22 @@ describe("rooms, participants and messages", () => {
     await denied(call(`${path}?since=${second.id}`, "GET", a.key), 429, "rate_limited");
     const next = await ok(call(`${path}?since=${first.id}`, "GET", a.key));
     expect(next.messages.map((m) => m.text)).toEqual(["방장이 쓴 다음 글"]);
-    await db.prepare("UPDATE participants SET last_read_at=unixepoch()-12 WHERE id=?").bind(a.participant_id).run();
+    await db.prepare("UPDATE participants SET last_read_at=unixepoch()-12,read_guard_at=unixepoch()-12 WHERE id=?").bind(a.participant_id).run();
     const empty = await call(plainPath, "GET", a.key);
     expect(empty.status).toBe(429);
     const wait = Number(empty.headers.get("retry-after"));
     expect(wait).toBeGreaterThan(15);
     expect(wait).toBeLessThanOrEqual(18);
     expect(await empty.json<Reply>()).toMatchObject({ error: "rate_limited", retry_after: wait });
-    const count = await db.prepare("SELECT SUM(count) AS total FROM rate_hits WHERE bucket='read' AND subject=?")
+    const count = await db.prepare("SELECT read_count AS total FROM participants WHERE id=?")
       .bind(a.participant_id).first("total");
     expect(count).toBe(4);
-    await db.prepare("UPDATE participants SET last_read_at=unixepoch()-31 WHERE id=?").bind(a.participant_id).run();
+    await db.prepare("UPDATE participants SET last_read_at=unixepoch()-31,read_guard_at=unixepoch()-31 WHERE id=?").bind(a.participant_id).run();
     expect((await (await call(plainPath, "GET", a.key)).text()).includes("# 새 글: 0개")).toBe(true);
     await denied(call(path, "GET", a.key), 429, "rate_limited");
     expect(a.connection_text.includes("사용자가 직접 확인을 요청하면")).toBe(true);
-    expect(a.connection_text.includes("최소 30초마다")).toBe(true);
+    expect(a.connection_text.includes("평소 최소 30초마다")).toBe(true);
+    expect(a.connection_text.includes("5분 이상의 간격을 권장")).toBe(true);
     expect(a.connection_text.includes("Retry-After")).toBe(true);
   });
 
@@ -491,7 +496,7 @@ describe("rooms, participants and messages", () => {
     expect(concurrent.map((res) => res.status).sort()).toEqual([200, 200, 429]);
 
     // After 30s passes, re-check works on both read paths and re-arms cooldown.
-    await db.prepare("UPDATE participants SET last_read_at=unixepoch()-31 WHERE id=?").bind(a.participant_id).run();
+    await db.prepare("UPDATE participants SET last_read_at=unixepoch()-31,read_guard_at=unixepoch()-31 WHERE id=?").bind(a.participant_id).run();
     expect((await ok(call(apiPath, "GET", a.key))).messages.map((m) => m.text)).toEqual(["첫 빈 뒤 바로 새 글"]);
     await denied(call(plainPath, "GET", a.key), 429, "rate_limited");
   });
@@ -720,7 +725,7 @@ describe("rooms, participants and messages", () => {
     const path = `/api/rooms/${r.room_id}/messages`;
     await ok(call(path, "GET", a.key));
     await ok(call(path, "POST", s.key, { text: "아직 읽지 않은 글" }));
-    await db.prepare("UPDATE rate_hits SET count=20,window_start=unixepoch()/60*60 WHERE bucket='read' AND subject=?")
+    await db.prepare("UPDATE participants SET read_count=20,read_minute=unixepoch()/60*60 WHERE id=?")
       .bind(a.participant_id).run();
     const capped = await call(path, "GET", a.key);
     expect(capped.status).toBe(429);
@@ -728,7 +733,7 @@ describe("rooms, participants and messages", () => {
     expect(wait).toBeGreaterThan(0);
     expect(wait).toBeLessThanOrEqual(60);
     expect(await capped.json<Reply>()).toMatchObject({ error: "rate_limited", retry_after: wait });
-    await db.prepare("DELETE FROM rate_hits WHERE bucket='read' AND subject=?").bind(a.participant_id).run();
+    await db.prepare("UPDATE participants SET read_count=0 WHERE id=?").bind(a.participant_id).run();
     expect((await ok(call(path, "GET", a.key))).messages.map((m) => m.text)).toEqual(["아직 읽지 않은 글"]);
   });
 
@@ -747,9 +752,9 @@ describe("rooms, participants and messages", () => {
       ),
     );
     expect(more.map((r) => r.status).sort()).toEqual([200, 200, 200, 200, 200, 200, 429]);
-    await denied(call(path + "/messages", "POST", s.key, { text: "a".repeat(6001) }), 400, "invalid");
-    await denied(call(path + "/messages", "POST", s.key, { text: "한".repeat(5462) }), 400, "invalid");
-    await ok(call(path + "/messages", "POST", s.key, { text: "한".repeat(5461) + "a" }));
+    await denied(call(path + "/messages", "POST", s.key, { text: "a".repeat(2001) }), 400, "invalid");
+    await denied(call(path + "/messages", "POST", s.key, { text: "한".repeat(1366) }), 400, "invalid");
+    await ok(call(path + "/messages", "POST", s.key, { text: "한".repeat(1048) + "a".repeat(952) }));
     await db
       .prepare("UPDATE rate_hits SET count=499 WHERE bucket='space_posts' AND subject=? AND window_start=?")
       .bind(s.space_id, dayStart())
@@ -826,15 +831,369 @@ describe("rooms, participants and messages", () => {
 });
 
 describe("security review repairs", () => {
+
+  it("caps room-list history scans while distinguishing exact, saturated and partial unread counts", async () => {
+    const s = await ok(signup()), outsider = await ok(signup());
+    const r = await room(s.key), other = await room(outsider.key);
+    const a = await member(r.room_id, s.key);
+    const add = (room: string, author: string, count: number, ageDays = 0) => db.prepare(
+      "WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM sequence WHERE n<?)" +
+      " INSERT INTO messages(room_id,participant_id,body,body_hash,created_at)" +
+      " SELECT ?,?,'합성 글','fixture-'||n,unixepoch()-?*86400 FROM sequence",
+    ).bind(count, room, author, ageDays).run();
+    const list = async (key: string) => {
+      const response = await call("/api/rooms", "GET", key);
+      expect(response.status).toBe(200);
+      return (await response.json<{ rooms: object[] }>()).rooms;
+    };
+    await add(r.room_id, a.participant_id, 99);
+    expect((await list(s.key))[0]).toMatchObject({ unread_count: 99, unread_partial: false, preview_partial: false });
+    await add(r.room_id, a.participant_id, 2);
+    expect((await list(s.key))[0]).toMatchObject({ unread_count: 100, unread_partial: false });
+    const ownerSeat = await db.prepare("SELECT id FROM participants WHERE room_id=? AND is_owner=1")
+      .bind(r.room_id).first<string>("id");
+    await add(r.room_id, ownerSeat!, 300);
+    expect((await list(s.key))[0]).toMatchObject({ unread_count: 0, unread_partial: true, last_message: "합성 글" });
+    await db.prepare("UPDATE participants SET last_read_id=(SELECT max(id) FROM messages WHERE room_id=?) WHERE id=?")
+      .bind(r.room_id, ownerSeat).run();
+    expect((await list(s.key))[0]).toMatchObject({ unread_count: 0, unread_partial: false, last_message: "합성 글" });
+
+    const old = await member(other.room_id, outsider.key);
+    await add(other.room_id, old.participant_id, 1);
+    await add(other.room_id, old.participant_id, 300, 40);
+    const rooms = await list(outsider.key);
+    expect(rooms).toHaveLength(1);
+    expect(rooms[0]).toMatchObject({ room_id: other.room_id, unread_count: 0, unread_partial: true, preview_partial: true, last_message: null });
+
+    const points = DEFAULT_SPACE_DAILY_WRITE_LIMIT - 3;
+    await db.prepare("UPDATE spaces SET request_day=?,request_count=2,request_write_estimate=? WHERE id=?")
+      .bind(dayStart(), points, s.space_id).run();
+    const capped = await call("/api/rooms", "GET", s.key);
+    expect(capped.status).toBe(429);
+    expect(await capped.json()).toMatchObject({ error: "quota", scope: "space_day" });
+    expect(await db.prepare("SELECT request_count,request_write_estimate FROM spaces WHERE id=?").bind(s.space_id).first())
+      .toEqual({ request_count: 2, request_write_estimate: points });
+    expect(await list(outsider.key)).toHaveLength(1);
+    await db.prepare("UPDATE messages SET created_at=unixepoch()-40*86400 WHERE room_id=?").bind(other.room_id).run();
+    expect((await list(outsider.key))[0]).toMatchObject({ unread_count: 0, unread_partial: false, preview_partial: false });
+  });
+
+
+  it("charges a space atomically without blocking another space and resets at midnight UTC", async () => {
+    const a = await ok(signup()), b = await ok(signup());
+    const confined = await room(a.key);
+    const memberA = await member(confined.room_id, a.key);
+    const today = dayStart();
+    vi.spyOn(Date, "now").mockReturnValue((today + 64_801) * 1000);
+    await db.prepare("UPDATE spaces SET request_day=?,request_write_estimate=? WHERE id=?")
+      .bind(today, DEFAULT_SPACE_DAILY_WRITE_LIMIT - 64, a.space_id).run();
+    const patch = () => call("/api/me", "PATCH", a.key, { room_limit: 5 });
+    const concurrent = await Promise.all([patch(), patch()]);
+    expect(concurrent.map(r => r.status).sort()).toEqual([200, 429]);
+    const rejected = concurrent.find(r => r.status === 429)!;
+    expect(Number(rejected.headers.get("retry-after"))).toBe(86_400 - 64_801);
+    expect(await rejected.json()).toMatchObject({ error: "quota", scope: "space_day" });
+    expect(await db.prepare("SELECT request_write_estimate FROM spaces WHERE id=?").bind(a.space_id)
+      .first("request_write_estimate")).toBe(DEFAULT_SPACE_DAILY_WRITE_LIMIT);
+    const text = await call("/r/" + confined.room_id + "/read", "GET", memberA.key);
+    expect(text.status).toBe(429);
+    expect(await text.text()).toMatch(/^error: quota\n이 공간의 .*UTC 자정/m);
+    await room(b.key);
+    const plan = await db.prepare("EXPLAIN QUERY PLAN SELECT SUM(request_write_estimate) FROM spaces WHERE request_day=?")
+      .bind(today).all<{ detail: string }>();
+    expect(plan.results.map(r => r.detail).join(" ")).toMatch(/USING INDEX spaces_request_day/);
+    vi.spyOn(Date, "now").mockReturnValue((today + 86_401) * 1000);
+    await ok(patch());
+    expect(await db.prepare("SELECT request_write_estimate FROM spaces WHERE id=?").bind(a.space_id)
+      .first("request_write_estimate")).toBe(66);
+  });
+
+  it("closes an oversized room inside the configured space allocation and still refuses a depleted space", async () => {
+    const s = await ok(signup());
+    const r = await room(s.key);
+    const tuned = { ...local, SPACE_DAILY_WRITE_LIMIT: "1000" };
+    await db.prepare(
+      "WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM sequence WHERE n<8000)" +
+      " INSERT INTO messages(room_id,participant_id,body,body_hash,created_at)" +
+      " SELECT room_id,id,'synthetic','fixture-'||n,unixepoch() FROM participants CROSS JOIN sequence" +
+      " WHERE room_id=? AND is_owner=1",
+    ).bind(r.room_id).run();
+    const deleting = await call("/api/rooms/" + r.room_id, "DELETE", s.key, undefined, tuned);
+    expect(deleting.status).toBe(200);
+    expect(await deleting.json()).toMatchObject({ deleted: true, cleanup_pending: true });
+    expect(await db.prepare("SELECT count(*) AS n FROM messages WHERE room_id=?").bind(r.room_id).first("n")).toBe(8000);
+    await db.prepare("UPDATE spaces SET request_day=?,request_write_estimate=1000 WHERE id=?")
+      .bind(dayStart(),s.space_id).run();
+    const rejected = await call("/api/me", "GET", s.key, undefined, tuned);
+    expect(rejected.status).toBe(429);
+    expect(rejected.headers.has("retry-after")).toBe(true);
+    expect(await rejected.json()).toMatchObject({ error: "quota", scope: "space_day" });
+    // This synthetic room is queued for cleanup. Later policy tests use their own retention fixtures.
+    await db.prepare("DELETE FROM rooms WHERE id=?").bind(r.room_id).run();
+  });
+
+
+  it("keeps an exhausted space recoverable and preserves the last reserve for recovery codes", async () => {
+    const s = await ok(signup()), other = await ok(signup());
+    const r = await room(s.key);
+    const a = await member(r.room_id, s.key);
+    const b = await member(r.room_id, s.key, "둘째 비서");
+    const now = Math.floor(Date.now() / 60_000) * 60 + 5;
+    vi.spyOn(Date, "now").mockReturnValue(now * 1000);
+    const setSpace = (points: number, requests: number) => db.prepare(
+      "UPDATE spaces SET request_day=?,request_write_estimate=?,request_count=? WHERE id=?",
+    ).bind(dayStart(), points, requests, s.space_id).run();
+    await setSpace(DEFAULT_SPACE_DAILY_WRITE_LIMIT, LIMITS.space_day[0]);
+    await denied(call("/api/me", "GET", s.key), 429, "rate_limited");
+    await room(other.key);
+    const one = "/api/rooms/" + r.room_id + "/participants/" + a.participant_id + "/revoke";
+    const all = "/api/me/participants/revoke-all";
+    await ok(call(one, "POST", s.key));
+    expect((await ok(call(all, "POST", s.key))).revoked_count).toBe(1);
+    for (const seat of [a, b]) await denied(call("/r/" + r.room_id + "/messages", "GET", seat.key), 403, "forbidden");
+    const restored = await ok(recover(s.recovery_codes[0]));
+    const state = await db.prepare("SELECT request_write_estimate,request_count FROM spaces WHERE id=?")
+      .bind(s.space_id).first();
+    expect(state).toEqual({
+      request_write_estimate: DEFAULT_SPACE_DAILY_WRITE_LIMIT + 64 + (32 + 3 * 2 + 2 * 12) + 96,
+      request_count: LIMITS.space_day[0] + 3,
+    });
+    await setSpace(DEFAULT_SPACE_DAILY_WRITE_LIMIT + 5900, LIMITS.space_day[0] + 95);
+    expect((await call(all, "POST", restored.key)).status).toBe(429);
+    await ok(recover(s.recovery_codes[1]));
+    await setSpace(DEFAULT_SPACE_DAILY_WRITE_LIMIT + 5900, LIMITS.space_day[0] + 100);
+    const rejected = await recover(s.recovery_codes[2]);
+    const wait = 86400 - now % 86400;
+    expect(rejected.status).toBe(429);
+    expect(rejected.headers.get("retry-after")).toBe(String(wait));
+    expect(await rejected.json()).toMatchObject({ error: "rate_limited", retry_after: wait });
+  });
+
+  it("clamps numeric space limits and reports the effective cap through authenticated usage", async () => {
+    const s = await ok(signup());
+    for (const [value, expected] of [["500", 1000], ["-1", 1000], [" 25500 ", 25500], ["40000", 30000], ["20,000", 24000]] as const) {
+      const response = await call("/api/me", "GET", s.key, undefined, { ...local, SPACE_DAILY_WRITE_LIMIT: value });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ limits: { space_daily_write_limit: expected, space_requests_per_day: 10000 } });
+    }
+  });
+
+  it("keeps 24 hours of cleanup for one deleted space below the service writing cutoff", async () => {
+    const gone = await ok(signup()), other = await ok(signup());
+    const deadRoom = await room(gone.key);
+    for (let i = 0; i < 6; i++) await member(deadRoom.room_id, gone.key, "합성 참가자 " + i);
+    await db.prepare(
+      "WITH RECURSIVE q(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM q WHERE n<3000)" +
+      " INSERT INTO messages(room_id,participant_id,body,body_hash,created_at)" +
+      " SELECT room_id,id,'x','h'||n,unixepoch()-5*86400 FROM participants CROSS JOIN q WHERE room_id=? AND is_owner=1",
+    ).bind(deadRoom.room_id).run();
+    const day = dayStart();
+    await db.batch([
+      db.prepare("UPDATE spaces SET status='deleted',deleted_at=? WHERE id=?").bind(day - 3 * 86400, gone.space_id),
+      db.prepare("DELETE FROM rate_hits"),
+      db.prepare("UPDATE spaces SET request_day=?,request_write_estimate=CASE WHEN id=? THEN 20000 ELSE 0 END,request_count=1")
+        .bind(day, other.space_id),
+    ]);
+    const clock = vi.spyOn(Date,"now");
+    for (let hour = 1; hour <= 24; hour++) {
+      clock.mockReturnValue((day + hour * 3600 - 2400) * 1000);
+      await purge(local);
+      expect(await readWriteEstimate(db)).toBeLessThanOrEqual(45_000);
+    }
+    expect(await readWriteEstimate(db)).toBeGreaterThan(20_000);
+    expect(await db.prepare("SELECT count(*) AS n FROM messages WHERE room_id=?").bind(deadRoom.room_id).first<number>("n"))
+      .toBeGreaterThan(0);
+    clock.mockReturnValue((day + 86000) * 1000);
+    await room(other.key);
+    expect(await readWriteEstimate(db)).toBeLessThan(STOP_MUTATIONS);
+  });
+
+  it("counts bad address confirmations against the existing send and space counters", async () => {
+    const s = await ok(signup());
+    const r = await room(s.key);
+    const a = await member(r.room_id, s.key);
+    vi.spyOn(Date, "now").mockReturnValue(Math.floor(Date.now() / 60_000) * 60_000 + 5_000);
+    const path = "/r/" + r.room_id + "/send?" + new URLSearchParams({
+      k: a.key, c: "amt_v2_0_" + "A".repeat(43), text: "합성 글",
+    });
+    const attempts = await Promise.all(Array.from({ length: 7 }, () => call(path)));
+    expect(attempts.map(r => r.status).sort()).toEqual([409, 409, 409, 409, 409, 409, 429]);
+    const tally = await db.prepare("SELECT bucket,count FROM rate_hits WHERE subject=? ORDER BY bucket")
+      .bind(a.participant_id).all();
+    expect(tally.results).toEqual([{ bucket: "send", count: 6 }, { bucket: "send_day", count: 6 }]);
+    expect(await db.prepare("SELECT count(*) AS n FROM messages WHERE room_id=?").bind(r.room_id).first("n")).toBe(0);
+    const spaceCount = await db.prepare("SELECT request_count FROM spaces WHERE id=?").bind(s.space_id).first("request_count");
+    expect(spaceCount).toBe(8);
+  });
+
+  it("gives bulk request retries and leaves already revoked seats untouched on space deletion", async () => {
+    const s = await ok(signup());
+    const r = await room(s.key);
+    const active = await member(r.room_id, s.key, "활성 비서");
+    const old = await member(r.room_id, s.key, "폐기 비서");
+    await db.prepare("UPDATE participants SET revoked=1 WHERE id=?").bind(old.participant_id).run();
+    await db.prepare("CREATE TRIGGER watch_revoked BEFORE UPDATE OF revoked ON participants WHEN OLD.revoked=1 BEGIN " +
+      "SELECT RAISE(ABORT,'already revoked'); END").run();
+    const now = Math.floor(Date.now() / 60_000) * 60 + 5;
+    vi.spyOn(Date, "now").mockReturnValue(now * 1000);
+    const del = () => call("/api/me", "DELETE", s.key, { confirm: "삭제" });
+    await db.prepare("UPDATE spaces SET request_day=?,request_count=? WHERE id=?").bind(dayStart(), LIMITS.space_day[0], s.space_id).run();
+    const daily = await del();
+    expect(daily.status).toBe(429);
+    expect(daily.headers.get("retry-after")).toBe(String(86400 - now % 86400));
+    expect(await daily.json()).toMatchObject({ error: "rate_limited", retry_after: 86400 - now % 86400 });
+    await db.prepare("UPDATE spaces SET request_count=2,request_minute=?,request_minute_count=60 WHERE id=?")
+      .bind(now - now % 60, s.space_id).run();
+    const minute = await call("/api/rooms/" + r.room_id, "DELETE", s.key);
+    expect(minute.headers.get("retry-after")).toBe("55");
+    expect(await minute.json()).toMatchObject({ error: "rate_limited", retry_after: 55 });
+    const revoke = await call("/api/me/participants/revoke-all", "POST", s.key);
+    expect(revoke.headers.get("retry-after")).toBe("55");
+    expect(await revoke.json()).toMatchObject({ error: "rate_limited", retry_after: 55 });
+    await db.prepare("UPDATE spaces SET request_minute_count=0 WHERE id=?").bind(s.space_id).run();
+    expect((await del()).status).toBe(200);
+    expect(await db.prepare("SELECT revoked FROM participants WHERE id=?").bind(active.participant_id).first("revoked")).toBe(1);
+    expect(await db.prepare("SELECT status FROM spaces WHERE id=?").bind(s.space_id).first("status")).toBe("deleted");
+  });
+
+  it("limits a source's daily auth-failure reserve without locking valid credentials all day", async () => {
+    const s = await ok(signup());
+    const r = await room(s.key);
+    const a = await member(r.room_id, s.key);
+    const path = "/r/" + r.room_id + "/messages";
+    const source = await sourceOf(new Request("http://127.0.0.1" + path), local);
+    const day = dayStart();
+    await db.prepare("INSERT INTO rate_hits(bucket,subject,window_start,count) VALUES('auth_fail_day',?,?,299)")
+      .bind(source, day).run();
+    const before = await db.prepare("SELECT count FROM rate_hits WHERE bucket='estimated_writes'").first<number>("count");
+    await denied(call(path, "GET", newKey("amk_")), 403, "forbidden");
+    await denied(call(path, "GET", newKey("amk_")), 429, "rate_limited");
+    expect(await db.prepare("SELECT count FROM rate_hits WHERE bucket='estimated_writes'").first("count")).toBe(before! + 12);
+    const rejected = await recover("invalid-fixture");
+    expect(rejected.status).toBe(429);
+    const delay = Number(rejected.headers.get("retry-after"));
+    expect(delay).toBeGreaterThan(0);
+    expect(await rejected.json()).toMatchObject({ error: "rate_limited", retry_after: delay });
+    expect((await call(path, "GET", a.key)).status).toBe(200);
+  });
+
+  it("counts authenticated malformed sends against the same participant limit as valid sends", async () => {
+    const s = await ok(signup());
+    const r = await room(s.key);
+    const a = await member(r.room_id, s.key);
+    const b = await member(r.room_id, s.key, "다른 비서");
+    const path = "/api/rooms/" + r.room_id + "/messages";
+    vi.spyOn(Date, "now").mockReturnValue(Math.floor(Date.now() / 60_000) * 60_000 + 5_000);
+    const attempts = await Promise.all(Array.from({ length: 7 }, () => call(path, "POST", a.key, { text: " " })));
+    expect(attempts.map(r => r.status).sort()).toEqual([400, 400, 400, 400, 400, 400, 429]);
+    const state = () => db.batch([
+      db.prepare("SELECT bucket,count FROM rate_hits WHERE subject=? ORDER BY bucket").bind(a.participant_id),
+      db.prepare("SELECT request_count,request_write_estimate FROM spaces WHERE id=?").bind(s.space_id),
+      db.prepare("SELECT count(*) AS n FROM messages WHERE room_id=?").bind(r.room_id),
+    ]).then(results => results.map(r => r.results));
+    const before = await state();
+    expect(before[0]).toEqual([{ bucket: "send", count: 6 }, { bucket: "send_day", count: 6 }]);
+    expect(before[2]).toEqual([{ n: 0 }]);
+    await denied(call(path, "POST", a.key, { text: "전송 제한 확인" }), 429, "rate_limited");
+    expect(await state()).toEqual(before);
+    await ok(call(path, "POST", b.key, { text: "다른 참가자의 정상 답" }));
+  });
+
+  it("stops new writes, stretches empty polls, then closes reads before the provider ceiling", async () => {
+    const s = await ok(signup());
+    const r = await room(s.key);
+    const a = await member(r.room_id, s.key);
+    const path = "/api/rooms/" + r.room_id + "/messages";
+    await ok(call(path, "POST", s.key, { text: "서버에 남을 기존 글" }));
+    const real = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(real + 60_000);
+    const setEstimate = (count: number) => db.prepare(
+      "UPDATE rate_hits SET count=? WHERE bucket='estimated_writes' AND subject='all' AND window_start=?",
+    ).bind(count, dayStart()).run();
+    const read = () => call(path, "GET", a.key);
+    const state = () => db.batch([
+      db.prepare("SELECT request_count,request_write_estimate FROM spaces WHERE id=?").bind(s.space_id),
+      db.prepare("SELECT read_count,last_read_id,read_guard_at FROM participants WHERE id=?").bind(a.participant_id),
+    ]).then(rows => rows.map(x => x.results[0]));
+    const quota = async (response: Response, text = false) => {
+      expect(response.status).toBe(429);
+      const wait = Number(response.headers.get("retry-after"));
+      expect(wait).toBe(86400 - Math.floor(Date.now() / 1000) % 86400);
+      if (text) {
+        expect(await response.text()).toMatch(/^error: quota\n오늘 .*UTC 자정/m);
+      } else {
+        expect(await response.json()).toMatchObject({ error: "quota", scope: "service_day", retry_after: wait });
+      }
+    };
+    await setEstimate(STOP_MUTATIONS - 20);
+    await quota(await call("/admin/rooms", "POST", env.TEST_OWNER_KEY, { name: "한도 확인" }));
+    expect(await db.prepare("SELECT count(*) AS n FROM rooms WHERE owner_id='o_default'").first("n")).toBe(0);
+
+    await setEstimate(STOP_MUTATIONS);
+    const me = await (await call("/api/me", "GET", s.key)).json<{ usage: { service_capacity: unknown } }>();
+    expect(me.usage.service_capacity).toMatchObject({ stage: "read_only", percent: 60 });
+    await quota(await call(path, "POST", s.key, { text: "더 쓸 수 없는 글" }));
+    await quota(await signup());
+    expect((await ok(read())).messages.map(m => m.text)).toEqual(["서버에 남을 기존 글"]);
+
+    await setEstimate(SLOW_READS);
+    clock.mockReturnValue(real + 120_000);
+    const before = await state();
+    const delayed = await read();
+    expect(delayed.status).toBe(429);
+    expect(Number(delayed.headers.get("retry-after"))).toBe(240);
+    expect(await state()).toEqual(before);
+
+    // The batch guard sees the new limit even while the isolate still has the earlier phase cached.
+    await setEstimate(STOP_TRAFFIC);
+    await quota(await call("/r/" + r.room_id + "/read?k=" + a.key, "GET"), true);
+    expect(await state()).toEqual(before);
+    expect(await db.prepare("SELECT count(*) AS n FROM messages WHERE room_id=?").bind(r.room_id).first("n")).toBe(1);
+  });
+
+  it("reuses an address confirmation without storage and spends it once in a concurrent send", async () => {
+    const s = await ok(signup());
+    const r = await room(s.key);
+    const a = await member(r.room_id, s.key);
+    const b = await member(r.room_id, s.key, "다른 비서");
+    const path = "/r/" + r.room_id;
+    const clock = Math.floor(Date.now() / 60_000) * 60_000 + 5_000;
+    vi.spyOn(Date, "now").mockReturnValue(clock);
+    const read = async () => {
+      const response = await call(path + "/read?k=" + a.key, "GET");
+      expect(response.status).toBe(200);
+      return /^# 보내기 확인값: (amt_v2_[\w-]+)$/m.exec(await response.text())?.[1];
+    };
+    const ticket = await read();
+    expect(ticket).toBeTruthy();
+    expect(await read()).toBe(ticket);
+    expect(await db.prepare("SELECT count(*) AS n FROM send_tickets").first("n")).toBe(0);
+    const send = (key: string, text: string) => call(path + "/send?" +
+      new URLSearchParams({ k: key, c: ticket!, text }), "GET");
+    expect((await send(b.key, "다른 키 답")).status).toBe(409);
+    expect((await Promise.all([send(a.key, "첫 답"), send(a.key, "둘째 답")]))
+      .map(r => r.status).sort()).toEqual([200, 409]);
+    vi.spyOn(Date, "now").mockReturnValue(clock + 60_000);
+    const after = await read();
+    expect(after).not.toBe(ticket);
+    const header = await call(path + "/messages", "GET", b.key);
+    expect(header.status).toBe(200);
+    expect(await header.json()).not.toHaveProperty("ticket");
+    expect(await db.prepare("SELECT count(*) AS n FROM send_tickets").first("n")).toBe(0);
+    vi.spyOn(Date, "now").mockReturnValue(clock + 31 * 60_000);
+    const expired = await call(path + "/send?" + new URLSearchParams({ k: a.key, c: after!, text: "만료 확인" }), "GET");
+    expect(expired.status).toBe(409);
+  });
+
   it("limits the space owner to 60/min and shares one daily allowance with legacy and web participant routes", async () => {
     const s = await ok(signup()),
       r = await room(s.key),
       p = await member(r.room_id, s.key, "사람", "human");
-    await db.prepare("UPDATE rate_hits SET count=59 WHERE bucket='space' AND subject=?").bind(s.space_id).run();
+    await db.prepare("UPDATE spaces SET request_minute_count=59,request_minute=unixepoch()/60*60 WHERE id=?").bind(s.space_id).run();
     await ok(call("/api/me", "GET", s.key));
     await denied(call("/api/me", "GET", s.key), 429, "rate_limited");
-    await db.prepare("DELETE FROM rate_hits WHERE bucket='space'").run();
-    await db.prepare("UPDATE rate_hits SET count=4999 WHERE bucket='space_day' AND subject=?").bind(s.space_id).run();
+    await db.prepare("UPDATE spaces SET request_minute_count=0 WHERE id=?").bind(s.space_id).run();
+    await db.prepare("UPDATE spaces SET request_count=?,request_day=unixepoch()/86400*86400 WHERE id=?").bind(LIMITS.space_day[0] - 1, s.space_id).run();
     await ok(call("/r/" + r.room_id + "/messages", "GET", p.key));
     await denied(call("/api/me", "GET", s.key), 429, "rate_limited");
     await denied(call("/api/rooms/" + r.room_id + "/messages", "GET", p.key), 429, "rate_limited");
@@ -868,7 +1227,7 @@ describe("security review repairs", () => {
     await denied(call("/app", "GET", newKey("amk_"), undefined, broken), 404, "not_found");
     await denied(call("/app", "GET", newKey("ams_"), undefined, broken), 404, "not_found");
     await ok(signup());
-    expect(await db.prepare("SELECT count FROM rate_hits WHERE bucket='estimated_writes'").first("count")).toBe(32);
+    expect(await db.prepare("SELECT count FROM rate_hits WHERE bucket='estimated_writes'").first("count")).toBe(SIGNUP_WRITE_WEIGHT);
   });
 
   it("recovers with the active member count and supports only revocation with a live space key while closed", async () => {
@@ -944,7 +1303,7 @@ describe("security review repairs", () => {
     expect(row.status).toBe("connected");
     expect(row.first_read_at).toBe(row.last_read_at);
     await db
-      .prepare("UPDATE participants SET first_read_at=unixepoch()-700,last_read_at=unixepoch()-600 WHERE id=?")
+      .prepare("UPDATE participants SET first_read_at=unixepoch()-700,last_read_at=unixepoch()-600,read_guard_at=unixepoch()-600 WHERE id=?")
       .bind(p.participant_id)
       .run();
     const first = (await info()).first_read_at;
@@ -958,9 +1317,28 @@ describe("v2.2 scoped conversations", () => {
   const pathOf = (id: string) => "/api/rooms/" + id;
   const patchMe = (key: string, body: unknown) => call("/api/me", "PATCH", key, body);
 
+  it("requires a clear group call for 비서들 and 출첵 while preserving leading names and aliases", () => {
+    const vooy = { id: "1", name: "부이1", ai_type: "vooy" };
+    const pickle = { id: "2", name: "피클", ai_type: "pickle" };
+    const members = [vooy, pickle];
+    const all = members.map(({ id }) => ({ id, step: null, direct: false }));
+    for (const text of ["비서들, 한 줄씩 알려주세요", "비서들 출첵", "출첵!", "출첵: 확인 부탁해요", "이 방의 @비서들 확인 부탁해요"]) {
+      expect(routeQuestion(text, members), text).toEqual(all);
+    }
+    for (const text of ["내 비서들", "오늘은 비서들 이야기를 나눴어요", "비서들 모임은 내일입니다", "출첵 결과를 정리했어요"]) {
+      expect(routeQuestion(text, members), text).toEqual([]);
+    }
+    const direct = [{ id: vooy.id, step: null, direct: true }];
+    for (const text of ["부이, 출첵", "브이, 비서들 이야기를 정리해 주세요", "부이1, 오늘은 @비서들 이야기를 정리해 주세요"]) {
+      expect(routeQuestion(text, members), text).toEqual(direct);
+    }
+    expect(routeQuestion("비서들: 확인", [{ ...vooy, name: "비서들" }, pickle])).toEqual(direct);
+    expect(routeQuestion("출첵: 확인", [{ ...vooy, name: "출첵1" }, pickle])).toEqual(direct);
+  });
+
   it("routes group calls only to active assistants and leaves ordinary posts unassigned", async () => {
     const owner = await ok(signup());
-    const r = await room(owner.key);
+    const r = await ok(call("/api/rooms", "POST", owner.key, { name: "내 비서들" }));
     const other = await room(owner.key);
     const p = pathOf(r.room_id);
     const auto = await member(r.room_id, owner.key, "업무 비서");
@@ -973,12 +1351,17 @@ describe("v2.2 scoped conversations", () => {
     await member(other.room_id, owner.key, "다른 방 비서");
     const post = (text: string) => ok(call(p + "/messages", "POST", owner.key, { text }));
     const all = await post("다들 출첵");
+    const shortAll = await post("비서들 출첵");
+    const roomName = await post("내 비서들");
     const direct = await post("업무 비서: 한 줄로 알려주세요");
     const plain = await post("오늘 일정은 다들 공유했습니다.");
     const read = async () => (await ok(call(p + "/messages?since=0", "GET", owner.key))).questions;
     const states = await read();
-    expect(states.filter((q) => q.question_id === all.id).map((q) => [q.participant_id, q.direct]))
-      .toEqual([[auto.participant_id, 0], [manual.participant_id, 0]]);
+    for (const group of [all, shortAll]) {
+      expect(states.filter((q) => q.question_id === group.id).map((q) => [q.participant_id, q.direct]))
+        .toEqual([[auto.participant_id, 0], [manual.participant_id, 0]]);
+    }
+    expect(states.filter((q) => q.question_id === roomName.id)).toEqual([]);
     expect(states.filter((q) => q.question_id === direct.id).map((q) => [q.participant_id, q.direct]))
       .toEqual([[auto.participant_id, 1]]);
     expect(states.filter((q) => q.question_id === plain.id)).toEqual([]);
@@ -1054,6 +1437,95 @@ describe("v2.2 scoped conversations", () => {
       .toMatchObject({ room_limit: 30, participant_limit: 50, retention_days: 30 });
   });
 
+  it("lets only the owner set a daily post limit and enforces it across concurrent senders", async () => {
+    const owner = await ok(signup());
+    const r = await room(owner.key);
+    const assistant = await member(r.room_id, owner.key);
+    const path = pathOf(r.room_id) + "/messages";
+    const me = () => ok(call("/api/me", "GET", owner.key));
+    expect(await me()).toMatchObject({ daily_post_limit: 500, limits: { messages_per_day: 500, max_messages_per_day: 600 } });
+    for (const daily_post_limit of [-1, 0, 1.5, 601, "600", null]) {
+      await denied(patchMe(owner.key, { daily_post_limit }), 400, "invalid");
+    }
+    await denied(patchMe(assistant.key, { daily_post_limit: 600 }), 403, "forbidden");
+    await denied(patchMe("", { daily_post_limit: 600 }), 401, "unauthorized");
+    expect(await me()).toMatchObject({ daily_post_limit: 500 });
+    expect(await ok(patchMe(owner.key, { daily_post_limit: 600 }))).toMatchObject({ daily_post_limit: 600 });
+    expect(await me()).toMatchObject({ limits: { messages_per_day: 600 } });
+    await db.prepare("INSERT INTO rate_hits VALUES('space_posts',?,?,500)").bind(owner.space_id, dayStart()).run();
+    await ok(call(path, "POST", owner.key, { text: "기본 상한을 넘긴 글" }));
+    await db.prepare("UPDATE rate_hits SET count=599 WHERE bucket='space_posts' AND subject=?")
+      .bind(owner.space_id).run();
+    const posts = await Promise.all([
+      call(path, "POST", owner.key, { text: "마지막 글" }),
+      call(`/r/${r.room_id}/send`, "POST", assistant.key, { text: "경계 검사" }),
+    ]);
+    expect(posts.map((response) => response.status).sort()).toEqual([200, 429]);
+    const rejected = posts.find((response) => response.status === 429)!;
+    const limit = await rejected.json();
+    expect(limit).toMatchObject({ error: "quota", scope: "space_posts", limit: 600,
+      message: expect.stringContaining("600건") });
+    expect(Number(rejected.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(await me()).toMatchObject({ usage: { messages_today: 600 } });
+    expect(await ok(patchMe(owner.key, { daily_post_limit: 550 }))).toMatchObject({ daily_post_limit: 550 });
+    const lowered = await call(path, "POST", owner.key, { text: "하향 이후 글" });
+    expect(lowered.status).toBe(429);
+    expect(await lowered.json()).toMatchObject({ limit: 550, message: expect.stringContaining("550건") });
+    expect(await me()).toMatchObject({ usage: { messages_today: 600 }, limits: { messages_per_day: 550 } });
+    const address = await member(r.room_id, owner.key, "주소 비서", "assistant", "get");
+    const read = await call(`/r/${r.room_id}/read?k=${address.key}`);
+    expect(read.status).toBe(200);
+    const ticket = /^# 보내기 확인값: (amt_v2_[\w-]+)$/m.exec(await read.text())?.[1];
+    expect(ticket).toBeTruthy();
+    const query = new URLSearchParams({ k: address.key, c: ticket!, text: "주소 방식 한도" });
+    const addressSend = await call(`/r/${r.room_id}/send?${query}`);
+    expect(addressSend.status).toBe(429);
+    expect(await addressSend.text()).toMatch(/^error: quota\n.*550건/m);
+  });
+
+  it("keeps raised post limits inside the existing space and service write budgets", async () => {
+    const owner = await ok(signup()), other = await ok(signup());
+    const r = await room(owner.key), otherRoom = await room(other.key);
+    const assistant = await member(r.room_id, owner.key, "검증 비서");
+    await ok(patchMe(owner.key, { daily_post_limit: MAX_DAILY_POST_LIMIT }));
+    const day = dayStart(), now = day + 64_801;
+    vi.spyOn(Date, "now").mockReturnValue(now * 1000);
+    const setPoints = (points: number) => db.prepare("UPDATE spaces SET request_day=?,request_write_estimate=? WHERE id=?")
+      .bind(day, points, owner.space_id).run();
+    const post = (text: string, SPACE_DAILY_WRITE_LIMIT?: string) => call(pathOf(r.room_id) + "/messages", "POST", owner.key,
+      { text }, { ...local, SPACE_DAILY_WRITE_LIMIT });
+    await setPoints(972);
+    const question = await post("검증 비서: 질문 예약점", "1000");
+    expect(question.status).toBe(429);
+    expect(await question.json()).toMatchObject({ error: "quota", scope: "space_day" });
+    await ok(post("같은 예산에서 일반 글", "1000"));
+    for (const [allocation, setting] of [[DEFAULT_SPACE_DAILY_WRITE_LIMIT, undefined], [30_000, "40000"]] as const) {
+      await setPoints(allocation - 28);
+      await ok(post(`공간 예산 마지막 글 ${allocation}`, setting));
+      const limited = await post("공간 예산 초과 글", setting);
+      expect(limited.status).toBe(429);
+      expect(await limited.json()).toMatchObject({ error: "quota", scope: "space_day" });
+      expect(await db.prepare("SELECT request_write_estimate FROM spaces WHERE id=?").bind(owner.space_id)
+        .first("request_write_estimate")).toBe(allocation);
+    }
+    await ok(call(pathOf(otherRoom.room_id) + "/messages", "POST", other.key, { text: "다른 공간의 글" }));
+    await setPoints(0);
+    await db.prepare("INSERT INTO rate_hits VALUES('send',?,?,?) ON CONFLICT DO UPDATE SET count=excluded.count")
+      .bind(r.owner_participant_id, now - now % 60, LIMITS.send[0]).run();
+    await denied(post("참가자 분당 한도 확인"), 429, "rate_limited");
+    await db.prepare("DELETE FROM rate_hits WHERE bucket='send' AND subject=?").bind(r.owner_participant_id).run();
+    await db.prepare("INSERT INTO rate_hits VALUES('send_day',?,?,?)")
+      .bind(assistant.participant_id, day, LIMITS.send_day[0]).run();
+    await denied(call(`/r/${r.room_id}/send`, "POST", assistant.key, { text: "참가자 일일 한도 확인" }), 429, "rate_limited");
+    const increase = STOP_MUTATIONS - 27 - await readWriteEstimate(db, day);
+    await db.prepare("INSERT INTO rate_hits VALUES('estimated_writes','all',?,?) ON CONFLICT DO UPDATE SET count=count+excluded.count")
+      .bind(day, increase).run();
+    const service = await post("서비스 예산 확인");
+    expect(service.status).toBe(429);
+    expect(await service.json()).toMatchObject({ error: "quota", scope: "service_day" });
+    expect(await readWriteEstimate(db, day)).toBe(STOP_MUTATIONS - 27);
+  });
+
   it("applies each retention policy in reads, replies, exports, and cron while preserving explicit deletion", async () => {
     const a = await ok(signup());
     const b = await ok(signup());
@@ -1090,6 +1562,83 @@ describe("v2.2 scoped conversations", () => {
     expect((await ok(call(q + "/export?format=txt", "GET", b.key))).chunk).toContain("다른 공간의 오래된 글");
     await ok(call(q, "DELETE", b.key));
     expect(await db.prepare("SELECT COUNT(*) n FROM messages WHERE room_id=?").bind(other.room_id).first("n")).toBe(0);
+  });
+
+  it("continues bounded mixed-age history without marking expired rows read or losing visible rows", async () => {
+    const s = await ok(signup());
+    const r = await room(s.key);
+    const header = await member(r.room_id, s.key, "헤더 비서");
+    const address = await member(r.room_id, s.key, "주소 비서");
+    const clock = vi.spyOn(Date, "now");
+    const now = dayStart() + 12 * 3600;
+    clock.mockReturnValue(now * 1000);
+    const cutoff = now - 30 * 86400;
+    try {
+      await db.prepare("WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<55)" +
+        " INSERT INTO messages(room_id,participant_id,body,body_hash,created_at) SELECT ?,?,'expired','old'||n,? FROM seq")
+        .bind(r.room_id, r.owner_participant_id, cutoff - 3600).run();
+      for (const [text, time] of [["visible first", cutoff + 3600], ["visible second", cutoff + 60]] as const) {
+        await db.prepare("INSERT INTO messages(room_id,participant_id,body,body_hash,created_at) VALUES(?,?,?,?,?)")
+          .bind(r.room_id, r.owner_participant_id, text, text, time).run();
+      }
+      const p = pathOf(r.room_id);
+      const hp = `/r/${r.room_id}/messages`;
+      const first = await ok(call(hp, "GET", header.key));
+      expect(first).toMatchObject({ messages: [], more: true });
+      expect(first.next).toBeGreaterThan(0);
+      expect(await db.prepare("SELECT last_read_id FROM participants WHERE id=?").bind(header.participant_id).first("last_read_id")).toBe(0);
+      expect((await ok(call(hp, "GET", header.key))).messages.map((m) => m.text)).toEqual(["visible first", "visible second"]);
+      const ap = `/r/${r.room_id}/read?k=${address.key}`;
+      const a1 = await (await call(ap)).text();
+      expect(a1).toContain(`# 다음 since: ${first.next}`);
+      const a2 = await (await call(ap)).text();
+      expect(a2).toContain("visible first");
+      expect(a2).toContain("visible second");
+      expect(a2).not.toContain("expired");
+      const ep = p + "/export?format=json";
+      const e1 = await ok(call(ep, "GET", s.key));
+      expect(e1).toMatchObject({ chunk: "", more: true, next: first.next });
+      await db.prepare("INSERT INTO messages(room_id,participant_id,body,body_hash,created_at) VALUES(?,?,?,?,?)")
+        .bind(r.room_id, r.owner_participant_id, "new after snapshot", "new", now).run();
+      const e2 = await ok(call(ep + `&since=${e1.next}&until=${e1.until}&policy=${encodeURIComponent(e1.policy)}`, "GET", s.key));
+      expect(JSON.parse(`[${e2.chunk}]`).map((row: { text: string }) => row.text)).toEqual(["visible first", "visible second"]);
+    } finally { clock.mockRestore(); }
+  });
+
+  it("opens on recent history then pages backward without moving the new-message cursor", async () => {
+    const s = await ok(signup());
+    const r = await room(s.key);
+    const guest = await member(r.room_id, s.key, "사람", "human");
+    const other = await room(s.key);
+    const p = pathOf(r.room_id) + "/messages";
+    await db.prepare("WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<121)" +
+      " INSERT INTO messages(room_id,participant_id,body,body_hash,created_at) SELECT ?,?,'fixture '||n,'h'||n,unixepoch() FROM seq")
+      .bind(r.room_id, r.owner_participant_id).run();
+    await db.prepare("UPDATE messages SET created_at=unixepoch()-40*86400 WHERE room_id=? AND body IN (?,?,?)")
+      .bind(r.room_id, "fixture 121", "fixture 73", "fixture 17").run();
+    const first = await ok(call(p + "?latest=1", "GET", s.key));
+    expect(first.messages[0].text).toBe("fixture 70");
+    expect(first.messages.at(-1)?.text).toBe("fixture 120");
+    expect(first.messages).toHaveLength(50);
+    expect(first.previous).toBe(first.messages[0].id);
+    const invited = await ok(call(p + "?latest=1", "GET", guest.key));
+    expect(invited.messages).toEqual(first.messages);
+    await denied(call(pathOf(other.room_id) + "/messages?latest=1", "GET", guest.key), 403, "forbidden");
+    await denied(call(p + "?latest=1&since=0", "GET", s.key), 400, "invalid");
+    const posted = await ok(call(p, "POST", s.key, { text: "새 글" }));
+    expect((await ok(call(p + `?since=${first.next}`, "GET", s.key))).messages.map((m) => m.id)).toEqual([posted.id]);
+    const seen = [...first.messages];
+    let current = first.previous;
+    for (let page = 0; current !== null && page < 4; page++) {
+      const old = await ok(call(p + `?before=${current}`, "GET", s.key));
+      expect(old.messages.every((m) => m.id < current!)).toBe(true);
+      seen.unshift(...old.messages);
+      current = old.previous;
+    }
+    expect(current).toBeNull();
+    expect(seen.map((m) => m.text)).toEqual(Array.from({ length: 121 }, (_, i) => i + 1)
+      .filter((i) => ![17, 73, 121].includes(i)).map((i) => `fixture ${i}`));
+    expect(await db.prepare("SELECT last_read_id FROM participants WHERE id=?").bind(r.owner_participant_id).first("last_read_id")).toBe(posted.id);
   });
 
   it("exports stable authorized pages in four formats, neutralizes spreadsheet formulas and aborts on policy change", async () => {

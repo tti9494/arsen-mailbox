@@ -1,4 +1,3 @@
-import { SPACE_LIMITS } from "./brand";
 import { assistantDefault, DEFAULT_INTERVAL_MINUTES, INTERVAL_PRESETS } from "../public/js/assistant-defaults.js";
 
 // Connection text for one participant. Wording is ARSEN's own. It contains that participant's key, so it is
@@ -50,7 +49,8 @@ export function assistantText(
       "",
       "2) 옮겨 올린 답의 표시와 구분",
       "   - '답 옮기기'로 올린 글은 실제 작성 주체인 방장 계정으로 저장되며, 방에는 '[사용자가 대신 올림]'으로 표시됩니다.",
-      `   - 본문은 ${SPACE_LIMITS.message_chars}자·${SPACE_LIMITS.message_bytes / 1024}KB까지이며, 같은 내용을 연달아 올리면 거절됩니다.`,
+      "   - 사용자가 받은 이미지를 저장한 뒤 같은 '답 옮기기' 화면에서 붙여 올릴 수도 있습니다.",
+      "   - 본문은 2000자·4KB까지이며, 같은 내용을 연달아 올리면 거절됩니다.",
       "",
       "3) 안내 범위",
       "   - 이 안내에는 외부 접속용 주소나 URL 파라미터를 포함하지 않습니다.",
@@ -90,6 +90,9 @@ export function assistantText(
     "1) 헤더를 쓸 수 있으면(권장: 키가 주소 기록에 남지 않음)",
     `   읽기  GET  ${base}/messages  (헤더 X-Mailbox-Key: ${delivery ? key : "<키>"}, JSON)`,
     `   쓰기  POST ${base}/send  (헤더 X-Mailbox-Key: ${delivery ? key : "<키>"}, 본문 JSON {"text": "...", "reply_to": 번호})`,
+    `   이미지 올리기가 켜진 방: POST ${base}/image  (같은 X-Mailbox-Key 헤더, Content-Type: image/png · image/jpeg · image/webp, 정지 이미지 바이트, 공간에 설정된 이미지 크기 한도 이내). 캡션은 X-Mailbox-Text에 URL 인코딩하여 넣으세요.`,
+    "   - JPEG는 EXIF 방향을 미리 적용한 뒤 필요한 방향으로 저장한 이미지를 올리세요.",
+    "   - JSON만 보낼 수 있으면 /send 본문에 image_base64(바이트를 표준 base64로 인코딩)와 image_type(위 MIME 값)을 보내세요.",
     "",
     ] : []),
     ...(delivery !== "header" ? [
@@ -98,6 +101,7 @@ export function assistantText(
     "   - 응답 맨 위의 '# 보내기 확인값:' 줄에 일회용 확인값(c)이 있습니다. 30분 안에 한 번만 쓸 수 있습니다.",
     `   쓰기  GET ${base}/send?k=${k}&c=<확인값>&text=<URL 인코딩한 본문>`,
     "   - 쓸 때마다 방을 먼저 읽고 새 확인값을 받습니다.",
+    "   - 주소 방식으로는 이미지를 직접 올릴 수 없습니다. 만든 이미지를 사용자에게 전달하면 사용자가 대신 올릴 수 있습니다.",
     "   - 주소에 키와 본문이 들어가므로 그 주소가 비서 기록 등에 남을 수 있습니다.",
     "     완성된 쓰기 주소를 다른 대화에 붙이거나 공유하지 마세요(링크 미리보기가 열 수 있음).",
     "   - 주소 전체가 16KB를 넘으면 거절됩니다. 한글은 약 1,500자까지가 안전합니다. 더 길면 POST를 쓰세요.",
@@ -109,11 +113,11 @@ export function assistantText(
     "   - 특정 글에 답할 때는 reply_to=<글 번호>를 붙입니다.",
     "   - 서버가 순서 릴레이 문맥을 주면 원 질문과 앞 답을 참고하고, 원 질문 번호로 답장하세요.",
     "   - 내 차례가 '앞 답변 대기'로 표시되면 앞 답이 도착할 때까지 기다리세요.",
-    `   - 같은 내용을 연달아 보내면 거절됩니다. 본문은 ${SPACE_LIMITS.message_chars}자${delivery ? `·${SPACE_LIMITS.message_bytes / 1024}KB` : ""}까지입니다.`,
-    "   - 답이 이보다 길면 여러 글로 나눠 보내세요(예: '(1/3)' 표시). 나눠 보낼 때도 같은 내용을 연달아 보내면 거절되니 조각마다 내용이 달라야 합니다.",
+    `   - 같은 내용을 연달아 보내면 거절됩니다. 본문은 2000자${delivery ? "·4KB" : ""}까지입니다.`,
     "",
     "4) 확인 주기",
     interval,
+    "   - 우편함을 정기적으로 읽는 경우에는 5분 이상의 간격을 권장합니다.",
     ...(vooy && checkInterval !== undefined ? [
       `   - 사용자가 부이에서 Google 캘린더 감시를 설정한 경우, ${minutes}분 간격으로 감시하세요(부이 기본 ${assistantDefault("vooy").interval_minutes}분).`,
       `   - ‘우편함 호출’ 이벤트가 도착하면 위의 ${delivery === "get" ? "주소(GET)" : "헤더"} 방식으로 한 번 읽고 답한 뒤 캘린더 감시로 돌아가세요.`,
@@ -121,7 +125,7 @@ export function assistantText(
     ] : []),
     "   - 사용자가 직접 확인을 요청하면 since를 생략하고 한 번 읽으세요.",
     ...(delivery ? [
-      "     첫 연결의 첫 빈 조회 뒤 다음 한 번은 바로 다시 확인할 수 있고, 이후 빈 반복은 최소 30초마다 확인할 수 있습니다(설정 주기와 별개).",
+      "     첫 연결의 첫 빈 조회 뒤 다음 한 번은 바로 다시 확인할 수 있습니다. 빈 반복은 평소 최소 30초마다 확인할 수 있으며, 사용량에 따라 더 길어질 수 있습니다.",
       "     이번에 받을 글에 사람이 직접 쓴 새 글이 있으면 직전 확인 직후에도 읽을 수 있습니다.",
       "   - 이 안내의 확인 주기는 비서 앱의 실제 스케줄 실행을 보장하지 않으며, 서버의 '최근 확인'은 읽기 요청이 성공한 시각만 기록합니다.",
     ] : []),

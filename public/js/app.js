@@ -1,20 +1,22 @@
 // 아르센 우편함 v2 메인 앱 컨트롤러 (화면 1~9 라우팅 · 폴링 · 보안 수칙 통합)
 
-import { ApiError, apiRequest, isAuthRefusal } from "./api.js?v=2.2.2";
-import { applyChatPreferences, notifyAssistantReply, openChatSettings, shouldSubmitMessage } from "./chat-settings.js?v=2.2.2";
+import { apiRequest, isAuthRefusal } from "./api.js?v=2.3.0";
+import { applyChatPreferences, notifyAssistantReply, openChatSettings, shouldSubmitMessage } from "./chat-settings.js?v=2.3.0";
 import {
   BRAND_NAME,
   HERO_TAGLINE,
   IDLE_THRESHOLD_MS,
   POLL_ACTIVE_MS,
   POLL_IDLE_MS,
+  POLL_OVERVIEW_ACTIVE_MS,
+  POLL_OVERVIEW_IDLE_MS,
   SENSITIVE_PATTERN,
   SPACE_LIMITS,
   TRUST_NOTICE_SHORT,
   errorMessage,
   kindMeta,
   validateMessageInput,
-} from "./constants.js?v=2.2.2";
+} from "./constants.js?v=2.3.0";
 import {
   buildAvatar,
   buildHeroIllustration,
@@ -32,8 +34,7 @@ import {
   isLongMessage,
   nowSeconds,
   refreshLiveCheckNodes,
-} from "./dom.js?v=2.2.2";
-import { MAX_SEND_CHUNKS, splitMessageText } from "./message-split.js?v=2.2.2";
+} from "./dom.js?v=2.3.0";
 import {
   clearRoomKey,
   clearSpaceKey,
@@ -47,21 +48,21 @@ import {
   setRoomRemember,
   setSpaceKey,
   setSpaceRemember,
-} from "./keystore.js?v=2.2.2";
+} from "./keystore.js?v=2.3.0";
 import {
   createSheetManager,
   makeTwoStepButton,
   openAddParticipantSheet,
-  openMessageSheet,
   openMobileMembersSheet,
   openParticipantDetailSheet,
   openRelaySheet,
   openRoomCreateSheet,
   openRoomManageSheet,
   serverParticipantStatus,
-} from "./sheets.js?v=2.2.2";
-import { PARTICIPANT_FILTERS, participantNotes, participantRole, participantRoleLabel } from "./participant-avatar.js?v=2.2.2";
-import { initTheme } from "./theme.js?v=2.2.2";
+} from "./sheets.js?v=2.3.0&history=2&maintenance=1";
+import { PARTICIPANT_FILTERS, participantNotes, participantRole, participantRoleLabel } from "./participant-avatar.js?v=2.3.0";
+import { initTheme } from "./theme.js?v=2.3.0";
+import { createImagePicker, createImageViewer, formatImageBytes, postImage } from "./images.js?v=2.3.0";
 
 initTheme();
 applyChatPreferences();
@@ -69,6 +70,8 @@ applyChatPreferences();
 const appRoot = document.getElementById("app-root");
 const sheetRoot = document.getElementById("sheet-root");
 const sheets = createSheetManager(sheetRoot);
+const imageViewer = createImageViewer();
+let composerPicker;
 
 // PWA 설치 프롬프트 보관(지원 브라우저)
 let deferredInstallPrompt = null;
@@ -95,12 +98,22 @@ const state = {
   questions: new Map(),
   notificationsArmed: false,
   lastMessageId: 0,
+  historyOpened: false,
+  historyBefore: null,
+  historyRequest: null,
+  historyError: "",
   retentionDays: 30,
   retentionRevision: 0,
   avatarUrls: new Map(),
   avatarPending: new Map(),
+  imageUploads: false,
+  imageMaxBytes: undefined,
+  imageMaxEdge: undefined,
+  imageDraft: null,
+  imageRevision: null,
   memberFilter: "all",
   guestMeta: { roomName: "", meName: "", meId: "" },
+  expandedMsgIds: new Set(),
   replyTo: null,
 
   mobilePane: "rooms", // 'rooms' | 'chat' | 'settings'
@@ -120,10 +133,12 @@ const state = {
 function bumpSessionGen() {
   state.sessionGen += 1;
   state.roomGen += 1;
+  state.historyRequest = null;
 }
 
 function bumpRoomGen() {
   state.roomGen += 1;
+  state.historyRequest = null;
 }
 
 function stopTimers() {
@@ -133,8 +148,28 @@ function stopTimers() {
   }
 }
 
+function resetHistory() {
+  state.lastMessageId = 0;
+  state.historyOpened = false;
+  state.historyBefore = null;
+  state.historyRequest = null;
+  state.historyError = "";
+}
+
+function resetImages() {
+  imageViewer.clear();
+  if (state.imageDraft) URL.revokeObjectURL(state.imageDraft.url);
+  state.imageDraft = null;
+  state.imageRevision = null;
+  state.imageUploads = false;
+  state.imageMaxBytes = undefined;
+  state.imageMaxEdge = undefined;
+  composerPicker = undefined;
+}
+
 function resetSessionView() {
   bumpSessionGen();
+  resetImages();
   state.pendingEnrollment = null;
   state.rooms = [];
   state.currentRoomId = "";
@@ -143,10 +178,11 @@ function resetSessionView() {
   state.messages = [];
   state.questions.clear();
   state.notificationsArmed = false;
-  state.lastMessageId = 0;
+  resetHistory();
   state.retentionDays = 30;
   state.retentionRevision = 0;
   state.guestMeta = { roomName: "", meName: "", meId: "" };
+  state.expandedMsgIds.clear();
   state.replyTo = null;
   state.meInfo = null;
   state.lastOverviewAt = 0;
@@ -183,10 +219,12 @@ function handleDefinitiveAuthRefusal(err, isGuest = false) {
 /** 방 단위 확정 거절(404 not_found 등) 시 해당 방 본문·참가자 캐시 즉시 파기 */
 function wipeCurrentRoomCache(err) {
   bumpRoomGen();
+  resetImages();
   state.messages = [];
   state.questions.clear();
   state.notificationsArmed = false;
-  state.lastMessageId = 0;
+  resetHistory();
+  state.expandedMsgIds.clear();
   state.replyTo = null;
   if (state.currentRoomId) {
     state.participantsByRoom.delete(state.currentRoomId);
@@ -202,6 +240,7 @@ function pruneExpiredMessagesNow() {
   const beforeLen = state.messages.length;
   if (!beforeLen) return false;
   state.messages = filterFreshMessages(state.messages, nowSeconds(), state.retentionDays);
+  imageViewer.keep(state.messages.filter((message) => message.image).map(({ id }) => id));
   return state.messages.length !== beforeLen;
 }
 
@@ -998,14 +1037,16 @@ async function loadSpaceBootstrap() {
 
 function resetRoomView(roomId) {
   bumpRoomGen();
+  resetImages();
   stopTimers();
   state.currentRoomId = roomId;
   state.messages = [];
   state.questions.clear();
   state.notificationsArmed = false;
-  state.lastMessageId = 0;
+  resetHistory();
   state.guestMeta = { roomName: "", meName: "", meId: "" };
   state.memberFilter = "all";
+  state.expandedMsgIds.clear();
   state.replyTo = null;
   state.settingsOpen = false;
 }
@@ -1032,15 +1073,18 @@ async function pollCurrentRoom(initial = false, refreshOverview = false) {
 
   const sGen = state.sessionGen;
   const rGen = state.roomGen;
+  const opening = initial || !state.historyOpened;
   let retryAfter = 0;
 
   try {
-    const sinceParam = initial ? 0 : state.lastMessageId;
+    const query = opening ? "latest=1" : `since=${state.lastMessageId}`;
     const msgPromise = apiRequest(
-      `/api/rooms/${encodeURIComponent(roomId)}/messages?since=${sinceParam}`,
+      `/api/rooms/${encodeURIComponent(roomId)}/messages?${query}`,
       { spaceKey, participantKey },
     );
-    const loadOverview = initial || refreshOverview || Date.now() - state.lastOverviewAt >= POLL_IDLE_MS;
+    const idle = Date.now() - state.lastInputAt >= IDLE_THRESHOLD_MS;
+    const overviewInterval = idle ? POLL_OVERVIEW_IDLE_MS : POLL_OVERVIEW_ACTIVE_MS;
+    const loadOverview = opening || refreshOverview || Date.now() - state.lastOverviewAt >= overviewInterval;
     const extraPromises = loadOverview
       ? [
           apiRequest(`/api/rooms/${encodeURIComponent(roomId)}/participants`, { spaceKey, participantKey })
@@ -1052,12 +1096,23 @@ async function pollCurrentRoom(initial = false, refreshOverview = false) {
     const [msgData, partData, roomsData] = await Promise.all([msgPromise, ...extraPromises]);
     // 보안 수칙 2: 거절·키 교체·방 변경 전에 시작된 늦은 응답은 즉시 폐기
     if (sGen !== state.sessionGen || rGen !== state.roomGen) return;
+    state.imageUploads = msgData.image_uploads === true;
+    state.imageMaxBytes = msgData.image_max_bytes;
+    state.imageMaxEdge = msgData.image_max_edge;
+    if (Number.isSafeInteger(msgData.room?.image_revision)) {
+      const changed = state.imageRevision !== null && state.imageRevision !== msgData.room.image_revision;
+      state.imageRevision = msgData.room.image_revision;
+      if (changed) {
+        imageViewer.clear();
+        if (!initial) return pollCurrentRoom(true);
+      }
+    }
     if (Object.hasOwn(msgData, "retention_days") &&
         (msgData.retention_days !== state.retentionDays || msgData.retention_revision !== state.retentionRevision)) {
       state.retentionDays = msgData.retention_days;
       state.retentionRevision = msgData.retention_revision;
       pruneExpiredMessagesNow();
-      if (!initial) return pollCurrentRoom(true);
+      if (!opening) return pollCurrentRoom(true);
     }
 
     if (isGuest) {
@@ -1080,7 +1135,10 @@ async function pollCurrentRoom(initial = false, refreshOverview = false) {
 
     const incoming = Array.isArray(msgData?.messages) ? msgData.messages : [];
     let newMessages = [];
-    if (initial) {
+    if (opening) {
+      resetHistory();
+      state.historyOpened = true;
+      state.historyBefore = Number.isSafeInteger(msgData.previous) && msgData.previous > 0 ? msgData.previous : null;
       state.questions.clear();
       state.messages = filterFreshMessages(incoming, nowSeconds(), state.retentionDays);
       state.lastMessageId = state.messages.reduce((mx, m) => Math.max(mx, Number(m.id) || 0), 0);
@@ -1096,18 +1154,15 @@ async function pollCurrentRoom(initial = false, refreshOverview = false) {
       }
       pruneExpiredMessagesNow();
     }
-    for (const q of msgData.questions ?? []) {
-      const participants = state.questions.get(q.question_id) ?? new Map();
-      participants.set(q.participant_id, q);
-      state.questions.set(q.question_id, participants);
-    }
+    if (Number.isSafeInteger(msgData.next) && msgData.next > state.lastMessageId) state.lastMessageId = msgData.next;
+    mergeQuestionStates(msgData.questions);
     if (state.retentionDays !== null) {
       const cutoff = nowSeconds() - state.retentionDays * 86400;
       for (const [id, rows] of state.questions) {
         if (rows.values().next().value.asked_at <= cutoff) state.questions.delete(id);
       }
     }
-    if (!initial && state.notificationsArmed) {
+    if (!opening && state.notificationsArmed) {
       const tracked = new Set(state.questions.keys());
       for (const rows of state.questions.values()) {
         for (const target of rows.values()) if (target.reply_id !== null) tracked.add(target.reply_id);
@@ -1117,6 +1172,7 @@ async function pollCurrentRoom(initial = false, refreshOverview = false) {
         (!tracked.has(m.reply_to) || accepted.has(m.id)));
       if (replies.length) notifyAssistantReply(roomId, replies.at(-1).id);
     }
+    if (newMessages.length) state.lastInputAt = Date.now();
     if (!msgData.more) state.notificationsArmed = true;
 
     state.offline = false;
@@ -1139,7 +1195,7 @@ async function pollCurrentRoom(initial = false, refreshOverview = false) {
     // 보안 수칙 3: 폴링이 실패해도 30일 지난 글은 즉시 비운다
     pruneExpiredMessagesNow();
     state.offline = err?.code === "offline";
-    if (err?.code === "rate_limited") retryAfter = err.retryAfter || 0;
+    if (["rate_limited", "space_day_quota", "service_day_quota"].includes(err?.code)) retryAfter = err.retryAfter || 0;
     state.statusBanner = {
       kind: err?.code === "offline" ? "warn" : "danger",
       text: errorMessage(err),
@@ -1152,7 +1208,73 @@ async function pollCurrentRoom(initial = false, refreshOverview = false) {
   }
 }
 
-/** 2.2 폴링 규칙: 보일 때 5초, 30초 입력 없으면 20초, 숨으면 멈춤 */
+function mergeQuestionStates(questions, keepKnown = false) {
+  for (const q of questions ?? []) {
+    const participants = state.questions.get(q.question_id) ?? new Map();
+    if (!keepKnown || !participants.has(q.participant_id)) participants.set(q.participant_id, q);
+    state.questions.set(q.question_id, participants);
+  }
+}
+
+async function loadOlderMessages() {
+  const before = state.historyBefore;
+  if (before === null || state.historyRequest || state.settingsOpen || document.hidden) return;
+  const isGuest = state.route === "guest";
+  const roomId = isGuest ? state.guestRoomId : state.currentRoomId;
+  const spaceKey = isGuest ? null : getSpaceKey();
+  const participantKey = isGuest ? getRoomKey(roomId) : null;
+  if (!roomId || (!spaceKey && !participantKey)) return;
+  const request = {};
+  state.historyRequest = request;
+  state.historyError = "";
+  const redraw = (prepend = false) => {
+    const box = document.getElementById("messages-scroll-box");
+    if (box) renderMessagesTimeline(box, prepend);
+  };
+  redraw();
+  let prepended = false;
+  try {
+    const data = await apiRequest(`/api/rooms/${encodeURIComponent(roomId)}/messages?before=${before}`, { spaceKey, participantKey });
+    if (state.historyRequest !== request) return;
+    if (data.retention_revision !== undefined && data.retention_revision !== state.retentionRevision) {
+      resetHistory();
+      return pollCurrentRoom(true);
+    }
+    const cursor = data.previous ?? null;
+    if (cursor !== null && (!Number.isSafeInteger(cursor) || cursor < 1 || cursor >= before)) throw new Error("invalid history cursor");
+    const known = new Set(state.messages.map((m) => m.id));
+    const older = (data.messages ?? []).filter((m) => m.id < before && !known.has(m.id));
+    state.messages = filterFreshMessages([...older, ...state.messages], nowSeconds(), state.retentionDays);
+    state.historyBefore = cursor;
+    mergeQuestionStates(data.questions, true);
+    prepended = older.length > 0;
+  } catch (err) {
+    if (state.historyRequest !== request) return;
+    if (isAuthRefusal(err)) return handleDefinitiveAuthRefusal(err, isGuest);
+    if (err?.code === "not_found") {
+      wipeCurrentRoomCache(err);
+      return renderApp();
+    }
+    state.historyError = errorMessage(err);
+  } finally {
+    if (state.historyRequest === request) {
+      state.historyRequest = null;
+      redraw(prepended);
+    }
+  }
+}
+
+function observeHistoryScroll(box) {
+  let top = box.scrollTop;
+  box.addEventListener("scroll", () => {
+    const current = box.scrollTop;
+    const reachedTop = current <= 48 && current < top;
+    top = current;
+    if (reachedTop && !state.historyError) void loadOlderMessages();
+  }, { passive: true });
+}
+
+/** 보이는 동안 입력이나 새 글 후 5초, 30초 동안 조용하면 60초, 숨으면 멈춤. */
 function scheduleNextPoll(minDelay = 0) {
   stopTimers();
   if (document.hidden || state.settingsOpen || state.offline) return;
@@ -1246,6 +1368,7 @@ function syncDynamicConversationUI() {
   if (roomsContainer) renderRoomListItems(roomsContainer);
   if (membersContainer) renderDesktopMembersList(membersContainer);
   const relayButton = document.getElementById("manual-relay-action");
+  composerPicker?.refresh();
   if (relayButton) relayButton.hidden = !currentParticipants().some((p) => canRelayFor(p));
   if (guestHeading) guestHeading.textContent = state.guestMeta.roomName || "초대받은 방";
   if (guestIdentity) {
@@ -1341,12 +1464,20 @@ function renderRoomListItems(listBox) {
           r.last_message_at
             ? el("span", { className: "room-card-time", text: formatTime(r.last_message_at) })
             : null,
-          unread > 0 ? el("span", { className: "unread-badge", text: String(unread) }) : null,
+          unread > 0 || r.unread_partial ? el("span", {
+            className: "unread-badge",
+            text: unread >= 100 ? "99+" : r.unread_partial ? "…" : String(unread),
+            "aria-label": unread >= 100 ? "읽지 않은 글 100개 이상" : r.unread_partial
+              ? (unread ? `읽지 않은 글 최소 ${unread}개` : "읽지 않은 글 확인이 필요합니다")
+              : `읽지 않은 글 ${unread}개`,
+          }) : null,
         ),
       ),
       el("span", {
         className: "room-card-preview",
-        text: r.last_message ? String(r.last_message).replace(/\s+/g, " ") : "아직 대화가 없어요",
+        text: r.last_message_image
+          ? ("(이미지) " + (r.last_message ?? "")).trimEnd().replace(/\s+/g, " ")
+          : r.last_message ? String(r.last_message).replace(/\s+/g, " ") : r.preview_partial ? "방에서 대화를 확인하세요" : "아직 대화가 없어요",
       }),
       avatarRow,
     );
@@ -1354,9 +1485,12 @@ function renderRoomListItems(listBox) {
   }
 }
 
-function renderMessagesTimeline(scrollBox) {
-  const wasNearBottom =
-    scrollBox.scrollHeight - scrollBox.scrollTop - scrollBox.clientHeight < 64;
+function renderMessagesTimeline(scrollBox, prepended = false) {
+  imageViewer.resetViewport();
+  const oldTop = scrollBox.scrollTop;
+  const oldHeight = scrollBox.scrollHeight;
+  const wasNearBottom = oldHeight - oldTop - scrollBox.clientHeight < 64;
+  const restoreHistoryFocus = scrollBox.contains(document.activeElement) && document.activeElement?.dataset.historyMore === "true";
   clearNode(scrollBox);
 
   const isGuest = state.route === "guest";
@@ -1372,6 +1506,21 @@ function renderMessagesTimeline(scrollBox) {
     );
     return;
   }
+
+  let historyButton;
+  if (state.historyBefore !== null) {
+    historyButton = el("button", {
+      type: "button",
+      className: "btn btn-sm",
+      "data-history-more": "true",
+      "aria-disabled": String(Boolean(state.historyRequest)),
+      text: state.historyRequest ? "이전 글 불러오는 중…" : "이전 글 더 보기",
+      onClick: () => void loadOlderMessages(),
+    });
+    scrollBox.appendChild(el("div", { className: "action-row" }, historyButton,
+      state.historyError ? el("p", { className: "field-hint", role: "status", text: state.historyError }) : null));
+  }
+  if (restoreHistoryFocus) (historyButton ?? scrollBox).focus({ preventScroll: true });
 
   // 렌더링 직전에도 항상 30일 만료 필터 강제 적용
   const fresh = filterFreshMessages(state.messages, nowSeconds(), state.retentionDays);
@@ -1398,6 +1547,10 @@ function renderMessagesTimeline(scrollBox) {
     return;
   }
 
+  const generation = state.sessionGen;
+  const view = state.roomGen;
+  const isCurrent = () => generation === state.sessionGen && view === state.roomGen;
+  const auth = isGuest ? { participantKey: getRoomKey(room.room_id) } : { spaceKey: getSpaceKey() };
   const members = currentParticipants();
   const ownerSeat = members.find((p) => p.is_owner);
   let prevDateKey = "";
@@ -1432,27 +1585,28 @@ function renderMessagesTimeline(scrollBox) {
 
     const bodyNode = buildSafeMessageNodes(m.text);
     const longMsg = isLongMessage(m.text);
-    if (longMsg) bodyNode.classList.add("is-clamped");
+    const expanded = state.expandedMsgIds.has(m.id);
+    if (longMsg && !expanded) {
+      bodyNode.classList.add("is-clamped");
+    }
 
-    // 카톡식: 긴 글은 말풍선에서 앞부분만 보이고, 전체보기 창에서 끝까지 읽습니다.
-    const moreBtn = longMsg
-      ? el(
-          "button",
-          {
-            type: "button",
-            className: "mini-action-btn",
-            "aria-haspopup": "dialog",
-            onClick: (e) =>
-              openMessageSheet(sheets, {
-                sender: displaySender,
-                when: `${formatDateLabel(m.created_at)} ${formatTime(m.created_at)}`,
-                text: m.text,
-                trigger: e.currentTarget,
-              }),
+    let moreBtn = null;
+    if (longMsg) {
+      moreBtn = el(
+        "button",
+        {
+          type: "button",
+          className: "mini-action-btn",
+          "aria-expanded": String(expanded),
+          onClick: () => {
+            if (state.expandedMsgIds.has(m.id)) state.expandedMsgIds.delete(m.id);
+            else state.expandedMsgIds.add(m.id);
+            renderMessagesTimeline(scrollBox);
           },
-          "전체보기",
-        )
-      : null;
+        },
+        expanded ? "접기" : "더 보기",
+      );
+    }
 
     const replyBtn = el(
       "button",
@@ -1474,7 +1628,27 @@ function renderMessagesTimeline(scrollBox) {
       m.reply_to
         ? el("div", { className: "msg-reply-ref", text: `#${m.reply_to} 글에 답장` })
         : null,
-      bodyNode,
+      m.image ? imageViewer.render(m, {
+        path: `/api/rooms/${encodeURIComponent(room.room_id)}/image/${m.id}`,
+        auth,
+        isCurrent,
+        onError: (err) => { if (isCurrent() && isAuthRefusal(err)) handleDefinitiveAuthRefusal(err, isGuest); },
+        onDelete: isGuest ? null : async () => {
+          if (!isCurrent()) return;
+          try {
+            await apiRequest(`/api/rooms/${encodeURIComponent(room.room_id)}/image/${m.id}`, { ...auth, method: "DELETE" });
+          } catch (err) {
+            if (isCurrent() && isAuthRefusal(err)) handleDefinitiveAuthRefusal(err, false);
+            throw err;
+          }
+          if (!isCurrent()) return;
+          imageViewer.forget(m.id);
+          delete m.image;
+          renderMessagesTimeline(scrollBox);
+          await pollCurrentRoom(true, true);
+        },
+      }) : null,
+      m.text ? bodyNode : null,
       buildQuestionStatus(m, isGuest),
     );
 
@@ -1518,9 +1692,8 @@ function renderMessagesTimeline(scrollBox) {
     scrollBox.appendChild(row);
   }
 
-  if (wasNearBottom) {
-    scrollBox.scrollTop = scrollBox.scrollHeight;
-  }
+  if (prepended) scrollBox.scrollTop = oldTop + scrollBox.scrollHeight - oldHeight;
+  else scrollBox.scrollTop = wasNearBottom ? scrollBox.scrollHeight : oldTop;
 }
 
 function canRelayFor(participant, directlyAddressed = false) {
@@ -1661,7 +1834,8 @@ async function triggerRelayForParticipant(initialParticipantId = null, trigger =
   }
   if (session !== state.sessionGen || view !== state.roomGen) return;
   const eligible = currentParticipants().filter((p) =>
-    canRelayFor(p, question?.direct) && (initialParticipantId === null || p.participant_id === initialParticipantId));
+    canRelayFor(p, question?.direct) &&
+    (initialParticipantId === null || p.participant_id === initialParticipantId));
   if (!eligible.length) return;
   openRelaySheet(sheets, {
     roomName: room.name,
@@ -1677,15 +1851,17 @@ async function triggerRelayForParticipant(initialParticipantId = null, trigger =
     retentionDays: state.retentionDays,
     trigger,
     onOpenAdd: (trig) => triggerAddParticipant(trig),
-    onPostRelayed: async ({ relayedFor, text }) => {
+    imageUploads: state.imageUploads,
+    imageMaxBytes: state.imageMaxBytes,
+    imageMaxEdge: state.imageMaxEdge,
+    onPostRelayed: async ({ relayedFor, text, image }) => {
       if (session !== state.sessionGen || view !== state.roomGen) return;
-      await postChunked({
-        roomId: room.room_id,
-        spaceKey: getSpaceKey(),
-        participantKey: null,
-        text,
-        relayedFor,
-        replyTo: question ? question.id : null,
+      const spaceKey = getSpaceKey();
+      if (image) await postImage(room.room_id, { spaceKey }, image, text, question?.id, relayedFor);
+      else await apiRequest(`/api/rooms/${encodeURIComponent(room.room_id)}/messages`, {
+        method: "POST",
+        spaceKey,
+        body: { text, relayed_for: relayedFor, ...(question ? { reply_to: question.id } : {}) },
       });
       if (session === state.sessionGen && view === state.roomGen) await pollCurrentRoom(false);
     },
@@ -1785,7 +1961,7 @@ function triggerParticipantDetail(participant, trigger) {
       }
     },
     onAfterChange: () => {
-      if (generation === state.sessionGen) return pollCurrentRoom(true);
+      if (generation === state.sessionGen) return pollCurrentRoom(false, true);
     },
   });
 }
@@ -1886,44 +2062,12 @@ function buildChatSettingsButton(isGuest, label = "채팅 설정") {
   }, icon("settings"));
 }
 
-/** 긴 글을 나눠 차례로 올립니다. 첫 글만 지정한 답장 대상에 붙이고, 나머지는 첫 글에 잇습니다(질문 자동 호출 방지).
- * 중간에 실패하면 이미 올라간 글은 되돌리지 않고, 아직 못 보낸 원문을 `remainingText`로 돌려줍니다. */
-async function postChunked({ roomId, spaceKey, participantKey, text, replyTo = null, relayedFor = null, onProgress = null }) {
-  const chunks = splitMessageText(text);
-  if (chunks.length > MAX_SEND_CHUNKS) throw new ApiError("text_too_long", 400);
-  let firstId = null;
-  for (let i = 0; i < chunks.length; i += 1) {
-    if (chunks.length > 1) onProgress?.(i + 1, chunks.length);
-    const parent = i === 0 ? replyTo : firstId;
-    try {
-      const data = await apiRequest(`/api/rooms/${encodeURIComponent(roomId)}/messages`, {
-        method: "POST",
-        spaceKey,
-        participantKey,
-        body: {
-          text: chunks[i].text,
-          ...(relayedFor ? { relayed_for: relayedFor } : {}),
-          ...(parent ? { reply_to: parent } : {}),
-        },
-      });
-      if (i === 0) firstId = data?.id ?? null;
-    } catch (ex) {
-      if (i > 0 && ex && typeof ex === "object") {
-        ex.sentCount = i;
-        ex.remainingText = chunks[i].rest;
-      }
-      throw ex;
-    }
-  }
-  return chunks.length;
-}
-
 function buildComposer({ isGuest }) {
   const textarea = el("textarea", {
     id: "composer-textarea",
     className: "composer-input",
     rows: "1",
-    maxlength: String(SPACE_LIMITS.max_chars * MAX_SEND_CHUNKS),
+    maxlength: "2000",
     placeholder: "메시지 입력…",
     "aria-label": "메시지 입력",
     "aria-describedby": "composer-shortcut-hint",
@@ -1934,8 +2078,6 @@ function buildComposer({ isGuest }) {
     className: "composer-hint",
     text: "Enter 보내기 · Shift+Enter 줄바꿈 (모바일은 보내기 버튼)",
   });
-  // 안내 문구는 채팅 설정이 보내기 키에 맞춰 다시 쓰므로, 분할 알림은 별도 줄에 둔다.
-  const splitNote = el("p", { id: "composer-split-note", className: "composer-hint", role: "status", hidden: true });
   const feedback = el("p", { className: "composer-feedback", role: "alert", hidden: true });
   const sendBtn = el(
     "button",
@@ -1948,7 +2090,24 @@ function buildComposer({ isGuest }) {
     icon("send", "icon-sm"),
   );
 
-  let sending = false;
+  let sending = false, failed = false;
+  const session = state.sessionGen;
+  const roomView = state.roomGen;
+  const imagePicker = createImagePicker(textarea, {
+    available: () => state.imageUploads,
+    maxBytes: () => state.imageMaxBytes,
+    maxEdge: () => state.imageMaxEdge,
+    active: () => session === state.sessionGen && roomView === state.roomGen && textarea.isConnected,
+    getDraft: () => state.imageDraft,
+    setDraft: (value) => { state.imageDraft = value; },
+    changed: () => syncInputState(),
+  });
+  composerPicker = { refresh: () => { imagePicker.refresh(); syncSendButton(); } };
+  function syncSendButton() {
+    const hasImage = state.imageUploads && Boolean(state.imageDraft);
+    sendBtn.disabled = sending || imagePicker.working || (!textarea.value.trim() && !hasImage) ||
+      Boolean(validateMessageInput(textarea.value));
+  }
   function syncInputState() {
     const val = textarea.value;
     textarea.rows = 1;
@@ -1957,13 +2116,10 @@ function buildComposer({ isGuest }) {
       const wrapRows = Math.max(1, Math.round((textarea.scrollHeight - 20) / 23.25));
       textarea.rows = Math.min(6, Math.max(newlineRows, wrapRows));
     }
-    const err = val.trim() ? validateMessageInput(val, { split: true }) : "";
-    const parts = !err && [...val].length > SPACE_LIMITS.max_chars ? splitMessageText(val).length : 1;
-    splitNote.textContent = parts > 1 ? `길어서 글 ${parts}개로 나눠 보냅니다.` : "";
-    splitNote.hidden = parts <= 1;
+    const err = val.trim() ? validateMessageInput(val) : "";
     feedback.textContent = err;
     feedback.hidden = !err;
-    sendBtn.disabled = sending || !val.trim() || Boolean(err);
+    syncSendButton();
   }
 
   textarea.addEventListener("input", syncInputState);
@@ -1998,30 +2154,42 @@ function buildComposer({ isGuest }) {
       className: "composer-wrap",
       onSubmit: async (e) => {
         e.preventDefault();
-        if (sending) return;
+        if (sending || imagePicker.working) return;
         const raw = textarea.value;
-        const err = validateMessageInput(raw, { split: true });
-        if (err || !raw.trim()) return;
+        const err = validateMessageInput(raw);
+        const image = state.imageDraft?.blob;
+        if (err || (!raw.trim() && !image)) return;
+        if (image && !state.imageUploads) {
+          feedback.textContent = errorMessage({ code: "image_disabled" });
+          feedback.hidden = false;
+          return;
+        }
 
         const roomId = isGuest ? state.guestRoomId : state.currentRoomId;
         if (!roomId) return;
         const generation = state.sessionGen;
         const view = state.roomGen;
         sending = true;
+        failed = false;
         sendBtn.disabled = true;
+        imagePicker.lock(true);
+        const auth = isGuest ? { participantKey: getRoomKey(roomId) } : { spaceKey: getSpaceKey() };
+        if (image) {
+          feedback.textContent = "올리는 중…";
+          feedback.hidden = false;
+        }
         try {
-          await postChunked({
-            roomId,
-            spaceKey: isGuest ? null : getSpaceKey(),
-            participantKey: isGuest ? getRoomKey(roomId) : null,
-            text: raw,
-            replyTo: state.replyTo?.id ?? null,
-            onProgress: (done, total) => {
-              feedback.textContent = `보내는 중… (${done}/${total})`;
-              feedback.hidden = false;
+          if (image) await postImage(roomId, auth, image, raw.trim(), state.replyTo?.id);
+          else await apiRequest(`/api/rooms/${encodeURIComponent(roomId)}/messages`, {
+            method: "POST",
+            ...auth,
+            body: {
+              text: raw.trim(),
+              ...(state.replyTo ? { reply_to: state.replyTo.id } : {}),
             },
           });
           if (generation !== state.sessionGen || view !== state.roomGen) return;
+          imagePicker.clear();
           textarea.value = "";
           textarea.rows = 1;
           state.replyTo = null;
@@ -2030,41 +2198,43 @@ function buildComposer({ isGuest }) {
           await pollCurrentRoom(false);
         } catch (ex) {
           if (generation !== state.sessionGen || view !== state.roomGen) return;
+          failed = true;
           if (isAuthRefusal(ex)) {
             handleDefinitiveAuthRefusal(ex, isGuest);
             return;
           }
-          const partial = typeof ex?.remainingText === "string";
-          if (partial) {
-            // 앞 글은 이미 올라갔습니다. 남은 글만 입력창에 두고 다시 보낼 수 있게 합니다.
-            textarea.value = ex.remainingText;
-            syncInputState();
-            state.replyTo = null;
-            syncReplyBar();
-            pollCurrentRoom(false);
-          }
-          feedback.textContent = (partial ? `${ex.sentCount}개만 올라갔어요. 남은 글은 입력창에 두었어요. ` : "") + errorMessage(ex);
+          feedback.textContent = errorMessage(ex);
           feedback.hidden = false;
         } finally {
           sending = false;
-          sendBtn.disabled = !textarea.value.trim() || Boolean(validateMessageInput(textarea.value, { split: true }));
+          if (generation === state.sessionGen && view === state.roomGen) {
+            imagePicker.lock(false);
+            syncSendButton();
+            if (!failed) feedback.hidden = true;
+          }
         }
       },
     },
     el("div", { id: "composer-reply-bar", className: "reply-bar", hidden: true }),
-    el("div", { className: "composer-row", role: "group", "aria-label": "메시지 작성" }, relayBtn, textarea, sendBtn),
+    imagePicker.bar,
+    el("div", { className: "composer-row", role: "group", "aria-label": "메시지 작성" },
+      ...imagePicker.buttons, relayBtn, textarea, sendBtn),
     shortcutHint,
-    splitNote,
+    imagePicker.status,
     feedback,
   );
 
+  syncSendButton();
   return form;
 }
 
 /** 화면 8: 설정 패널 */
-function buildSpacePolicy(me, statusNote) {
+function buildSpacePolicy(me, statusNote, postsUsage) {
   const rooms = el("input", { id: "space-room-limit", type: "number", className: "input", min: 1, max: 30, value: me?.room_limit ?? 5, required: true });
   const people = el("input", { id: "space-participant-limit", type: "number", className: "input", min: 1, max: 50, value: me?.participant_limit ?? 8, required: true });
+  const maxPosts = me?.limits?.max_messages_per_day ?? SPACE_LIMITS.messages_per_day;
+  const posts = el("input", { id: "space-daily-post-limit", type: "number", className: "input", min: 1, max: maxPosts,
+    value: me?.daily_post_limit ?? SPACE_LIMITS.messages_per_day, disabled: !me?.limits?.max_messages_per_day, required: true });
   const retention = el("select", { id: "space-retention", className: "select" },
     ...[["permanent", "영구 (자동 만료 없음)"], ["90", "90일"], ["30", "30일"], ["7", "7일"]]
       .map(([value, text]) => el("option", { value, text })));
@@ -2084,11 +2254,14 @@ function buildSpacePolicy(me, statusNote) {
       try {
         const updated = await apiRequest("/api/me", { method: "PATCH", spaceKey: getSpaceKey(), body: {
           room_limit: rooms.valueAsNumber, participant_limit: people.valueAsNumber, retention_days: after,
+          ...(posts.disabled ? {} : { daily_post_limit: posts.valueAsNumber }),
           ...(shorter ? { confirm: "보관 기간 단축" } : {}),
         } });
         if (session !== state.sessionGen) return;
         state.meInfo = { ...state.meInfo, ...updated, limits: { ...state.meInfo?.limits,
-          rooms: updated.room_limit, participants: updated.participant_limit, retention_days: updated.retention_days } };
+          rooms: updated.room_limit, participants: updated.participant_limit, retention_days: updated.retention_days,
+          messages_per_day: updated.daily_post_limit ?? state.meInfo?.limits?.messages_per_day ?? SPACE_LIMITS.messages_per_day } };
+        postsUsage.textContent = `${state.meInfo.usage?.messages_today ?? "—"} / ${state.meInfo.limits.messages_per_day}`;
         state.retentionDays = updated.retention_days;
         state.retentionRevision = updated.retention_revision;
         pruneExpiredMessagesNow();
@@ -2102,6 +2275,7 @@ function buildSpacePolicy(me, statusNote) {
       el("label", { for: "space-room-limit", text: "공간당 방 상한 (1–30)" }), rooms,
       el("label", { for: "space-participant-limit", text: "방당 인원 상한 (1–50)" }), people,
       el("p", { className: "field-hint", text: "방장과 폐기된 참가자 자리도 인원에 포함됩니다. 상한을 내려도 기존 방과 참가자는 유지됩니다." }),
+      el("label", { for: "space-daily-post-limit", text: `공간당 하루 글 상한 (1–${maxPosts})` }), posts,
       el("label", { for: "space-retention", text: "글 보관 기간" }), retention, save,
       statusNote,
     ));
@@ -2111,6 +2285,10 @@ function buildSettingsPane() {
   const me = state.meInfo;
   const limits = me?.limits || SPACE_LIMITS;
   const usage = me?.usage ?? {};
+  const capacity = usage.service_capacity;
+  const postsUsage = el("div", { id: "settings-messages-today", className: "usage-stat-val",
+    text: `${usage.messages_today ?? "—"} / ${limits.messages_per_day}` });
+  const capacityLabels = { normal: "정상", read_only: "쓰기 제한", slow_reads: "빈 조회 간격 연장", closed: "오늘 마감" };
 
   const statusNote = el("p", { className: "field-hint", role: "status", "aria-live": "polite" });
   const onceResultSlot = el("div", { className: "doc-list" });
@@ -2349,7 +2527,7 @@ function buildSettingsPane() {
             "div",
             { className: "usage-stat" },
             el("div", { className: "usage-stat-label", text: "오늘 보낸 글" }),
-            el("div", { id: "settings-messages-today", className: "usage-stat-val", text: `${usage.messages_today ?? "—"} / ${limits.messages_per_day}` }),
+            postsUsage,
           ),
           el(
             "div",
@@ -2363,9 +2541,18 @@ function buildSettingsPane() {
             el("div", { className: "usage-stat-label", text: "대화 보관" }),
             el("div", { className: "usage-stat-val", text: limits.retention_days === null ? "영구" : `${limits.retention_days}일` }),
           ),
+          Number.isFinite(usage?.image_storage_bytes) ? el("div", { className: "usage-stat" },
+            el("div", { className: "usage-stat-label", text: "이미지 저장량" }),
+            el("div", { className: "usage-stat-val", text: `${formatImageBytes(usage.image_storage_bytes)} / ${formatImageBytes(limits.image_storage_bytes)}` }),
+            el("div", { className: "usage-stat-label", text: `오늘 ${usage.images_today} / ${limits.images_per_day}장 · 한 장 ${formatImageBytes(limits.image_max_bytes)}까지` }),
+          ) : null,
+          capacity ? el("div", { className: "usage-stat" },
+            el("div", { className: "usage-stat-label", text: "오늘 우편함 서비스 사용량 (추정)" }),
+            el("div", { className: "usage-stat-val", text: `${capacity.percent}% · ${capacityLabels[capacity.stage] ?? "상태 확인 중"}` }),
+          ) : null,
         ),
       ),
-      buildSpacePolicy(me, el("p", { className: "field-hint", role: "status", "aria-live": "polite" })),
+      buildSpacePolicy(me, el("p", { className: "field-hint", role: "status", "aria-live": "polite" }), postsUsage),
       el(
         "section",
         { className: "settings-card" },
@@ -2584,10 +2771,12 @@ function renderOwnerApp() {
     id: "messages-scroll-box",
     className: "messages-scroll",
     role: "log",
+    tabindex: "0",
     "aria-live": "polite",
     "aria-label": "방 대화 목록",
   });
   renderMessagesTimeline(msgScrollBox);
+  observeHistoryScroll(msgScrollBox);
 
   const chatPane = el(
     "main",
@@ -2636,7 +2825,7 @@ function renderOwnerApp() {
                     onDeleteRoom: async (rid) => {
                       const generation = state.sessionGen;
                       bumpRoomGen();
-                      await apiRequest(`/api/rooms/${encodeURIComponent(rid)}`, {
+                      const result = await apiRequest(`/api/rooms/${encodeURIComponent(rid)}`, {
                         method: "DELETE",
                         spaceKey: getSpaceKey(),
                       });
@@ -2646,6 +2835,10 @@ function renderOwnerApp() {
                       window.history.replaceState(null, "", "/app");
                       state.mobilePane = "rooms";
                       await loadSpaceBootstrap();
+                      if (result.cleanup_pending && generation === state.sessionGen) {
+                        state.statusBanner = { kind: "accent", text: "방을 닫았습니다. 기록과 이미지는 정기 작업에서 나누어 지웁니다." };
+                        renderApp();
+                      }
                     },
                   }),
               },
@@ -2728,18 +2921,8 @@ function renderOwnerApp() {
       { className: "members-pane desktop-only", "aria-label": "참가자 패널" },
       el(
         "div",
-        { className: "pane-topbar" },
+        { className: "pane-topbar members-topbar" },
         el("h2", { className: "pane-title", text: "참가자" }),
-        el("select", { className: "select", "aria-label": "참가자 역할 필터",
-          onChange: (e) => {
-            state.memberFilter = e.target.value;
-            renderDesktopMembersList(membersBox);
-          },
-        }, ...PARTICIPANT_FILTERS.map(([value, text]) => {
-          const option = el("option", { value, text });
-          option.selected = state.memberFilter === value;
-          return option;
-        })),
         room
           ? el(
               "button",
@@ -2752,6 +2935,16 @@ function renderOwnerApp() {
               "참가자 넣기",
             )
           : null,
+        el("select", { className: "select", "aria-label": "참가자 역할 필터",
+          onChange: (e) => {
+            state.memberFilter = e.target.value;
+            renderDesktopMembersList(membersBox);
+          },
+        }, ...PARTICIPANT_FILTERS.map(([value, text]) => {
+          const option = el("option", { value, text });
+          option.selected = state.memberFilter === value;
+          return option;
+        })),
       ),
       membersBox,
     );
@@ -2890,10 +3083,12 @@ function renderGuestRoomApp() {
     id: "messages-scroll-box",
     className: "messages-scroll",
     role: "log",
+    tabindex: "0",
     "aria-live": "polite",
     "aria-label": "초대된 방 대화",
   });
   renderMessagesTimeline(msgScrollBox);
+  observeHistoryScroll(msgScrollBox);
 
   const shell = el(
     "div",

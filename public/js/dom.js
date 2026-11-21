@@ -7,8 +7,8 @@ import {
   SENSITIVE_PATTERN,
   kindMeta,
   resolveIntervalMinutes,
-} from "./constants.js?v=2.2.2";
-import { applyTheme, getThemeMode, onThemeChange } from "./theme.js?v=2.2.2";
+} from "./constants.js?v=2.3.0";
+import { applyTheme, getThemeMode, onThemeChange } from "./theme.js?v=2.3.0";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 

@@ -910,6 +910,12 @@ label {
   padding: var(--sp-2) var(--sp-4) 0;
 }
 
+.status-slot .banner > .btn {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+
 .messages-scroll {
   flex: 1;
   min-height: 0;
@@ -1120,6 +1126,13 @@ label {
   min-width: 0;
   min-height: 0;
 }
+
+.members-topbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+.members-topbar .btn { white-space: nowrap; }
+.members-topbar .select { grid-column: 1 / -1; min-width: 0; }
 
 .members-body {
   flex: 1;
@@ -1666,3 +1679,65 @@ label {
 }
 .participant-device { flex: 0 1 auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; }
 .participant-role-note { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Private message images use the active chat surface and bubble radius. */
+.composer-add-image {
+  flex: none;
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.image-draft {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1);
+  background: var(--surface-subtle);
+  color: var(--text);
+  border-radius: var(--radius);
+}
+
+.image-draft[hidden] { display: none; }
+.image-draft img { border-radius: var(--radius-sm); object-fit: cover; }
+.image-draft button { margin-inline-start: auto; }
+
+.message-image-frame { max-inline-size: 100%; }
+.message-image {
+  display: block;
+  max-width: 100%;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: inherit;
+  background: var(--surface-subtle);
+  cursor: zoom-in;
+}
+.message-image-frame { border-radius: inherit; }
+.message-image[hidden] { display: none; }
+.message-image img {
+  display: block;
+  max-width: 100%;
+  max-height: 320px;
+  height: auto;
+  object-fit: contain;
+}
+.message-image-frame + .msg-body { margin-block-start: var(--sp-1); }
+
+.image-dialog {
+  max-width: min(100vw - 24px, 1200px);
+  max-height: calc(100dvh - 24px);
+  border: 0;
+  border-radius: var(--radius);
+  padding: var(--sp-3);
+  color: var(--text);
+  background: var(--surface);
+}
+.image-dialog::backdrop { background: rgb(0 0 0 / 83%); }
+.image-dialog-actions { justify-content: flex-end; }
+.image-dialog img {
+  display: block;
+  margin: var(--sp-2) auto 0;
+  max-width: 100%;
+  max-height: calc(100dvh - 120px);
+  object-fit: contain;
+}

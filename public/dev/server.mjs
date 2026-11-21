@@ -6,7 +6,7 @@ import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createMockStore } from "./mock.js?v=2.2.2";
+import { createMockStore } from "./mock.js?v=2.3.0";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_ROOT = path.resolve(__dirname, "..");
@@ -35,7 +35,7 @@ const SECURITY_HEADERS = {
   "x-robots-tag": "noindex, nofollow, noarchive",
   "x-frame-options": "DENY",
   "content-security-policy":
-    "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'",
+    "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com; img-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'",
 };
 
 const store = createMockStore(`http://${HOST}:${PORT}`);
@@ -57,7 +57,7 @@ async function readJsonBody(req) {
   let total = 0;
   for await (const chunk of req) {
     total += chunk.length;
-    if (total > 32768) throw new Error("body_too_large");
+    if (total > 16384) throw new Error("body_too_large");
     chunks.push(chunk);
   }
   if (!total) return {};

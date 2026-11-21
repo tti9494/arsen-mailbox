@@ -1,4 +1,5 @@
-import { assistantDefault } from "./assistant-defaults.js?v=2.2.2";
+import { createImagePicker } from "./images.js?v=2.3.0";
+import { assistantDefault } from "./assistant-defaults.js?v=2.3.0";
 // 시트·모달 화면 모음 (화면 6 참가자 넣기, 화면 7 참가자 상세·재발급, 답 옮기기, 새 방·방 수정)
 // - 보안 수칙 4: 참가자 추가 창과 재발급 창을 열 때마다 전달 방식을 기본값 '헤더(header)'로 초기화
 // - 보안 수칙 6: 연결 상태(created / connected / last_seen)는 추측하지 않고 서버가 준 status 값만 표시
@@ -17,14 +18,12 @@ import {
   validateIntervalMinutesInput,
   validateMessageInput,
   validateNameInput,
-  SPACE_LIMITS,
-} from "./constants.js?v=2.2.2";
-import { AVATAR_PRESETS, PARTICIPANT_FILTERS, avatarThumbnail, participantNotes, participantRole, participantRoleLabel } from "./participant-avatar.js?v=2.2.2";
+} from "./constants.js?v=2.3.0";
+import { AVATAR_PRESETS, PARTICIPANT_FILTERS, avatarThumbnail, participantNotes, participantRole, participantRoleLabel } from "./participant-avatar.js?v=2.3.0";
 import {
   appendNodes,
   buildAvatar,
   buildLiveScheduleNode,
-  buildSafeMessageNodes,
   buildSafeTranscript,
   clearNode,
   describeAssistantSchedule,
@@ -32,9 +31,8 @@ import {
   formatAgo,
   icon,
   resolveLastCheckedSeconds,
-} from "./dom.js?v=2.2.2";
-import { getKindUsageCounts, recordKindUsage } from "./keystore.js?v=2.2.2";
-import { MAX_SEND_CHUNKS } from "./message-split.js?v=2.2.2";
+} from "./dom.js?v=2.3.0";
+import { getKindUsageCounts, recordKindUsage } from "./keystore.js?v=2.3.0";
 
 /** 서버가 돌려준 status 값만으로 3단계 표시 정보를 만든다(클라이언트 추측 금지) */
 export function serverParticipantStatus(p) {
@@ -185,7 +183,8 @@ export function createSheetManager(sheetRoot) {
     });
 
     const firstInput = bodyBox.querySelector("input:not([disabled]), textarea:not([disabled]), button:not([disabled])");
-    (firstInput || closeBtn).focus();
+    // 포커스가 아래쪽 첫 컨트롤로 가면서 시트 내용이 위에서부터 잘려 스크롤되지 않게 한다.
+    (firstInput || closeBtn).focus({ preventScroll: true });
   }
 
   return { openSheet, closeSheet };
@@ -1247,15 +1246,20 @@ export function openRelaySheet(
     retentionDays,
     trigger,
     onPostRelayed,
+    imageUploads = false,
+    imageMaxBytes,
+    imageMaxEdge,
     onOpenAdd,
   },
 ) {
   const aiMembers = participants.filter((p) =>
     p.kind === "assistant" && !p.revoked && (!question || p.participant_id === initialParticipantId));
 
+  let imagePicker;
   sheets.openSheet({
     title: "AI 답 옮기기 (대신 올림)",
     trigger,
+    onDispose: () => imagePicker?.clear(),
     buildBody: (bodyBox, closeSheet) => {
       if (!aiMembers.length) {
         bodyBox.append(
@@ -1341,7 +1345,7 @@ export function openRelaySheet(
         id: "relay-answer-text",
         className: "textarea",
         rows: "5",
-        maxlength: String(SPACE_LIMITS.max_chars * MAX_SEND_CHUNKS),
+        maxlength: "2000",
         placeholder: "AI(예: 하크·챗GPT·제미나이)에게서 받은 답을 여기에 붙여 넣으세요",
       });
 
@@ -1353,36 +1357,43 @@ export function openRelaySheet(
         "③ 선택한 AI 이름으로 올리기",
       );
 
+      let draft = null, sending = false;
       const form = el(
         "form",
         {
           className: "doc-list",
           onSubmit: async (e) => {
             e.preventDefault();
-            const checkErr = validateMessageInput(answerArea.value, { split: true });
-            if (checkErr || !answerArea.value.trim()) {
-              errLine.textContent = checkErr || "붙여 넣을 답 본문을 입력해 주세요.";
+            if (sending || imagePicker?.working) return;
+            const checkErr = validateMessageInput(answerArea.value);
+            if (checkErr || !draft && !answerArea.value.trim()) {
+              errLine.textContent = checkErr || "옮길 답을 쓰거나 이미지를 붙여 주세요.";
               errLine.hidden = false;
               return;
             }
+            const original = submitBtn.textContent;
             errLine.hidden = true;
-            submitBtn.disabled = true;
+            sending = submitBtn.disabled = true;
+            imagePicker?.lock(true);
+            if (draft) submitBtn.textContent = "올리는 중…";
             try {
               const chosen = aiMembers.find((p) => p.participant_id === aiSelect.value);
               await onPostRelayed({
                 relayedFor: aiSelect.value,
                 text: answerArea.value.trim(),
+                image: draft?.blob,
               });
               if (chosen) {
                 recordKindUsage(kindMeta(chosen).ai_type);
               }
               closeSheet();
             } catch (err) {
-              const partial = typeof err?.remainingText === "string";
-              if (partial) answerArea.value = err.remainingText; // 앞 글은 이미 올라갔으니 남은 글만 다시 보냅니다
-              errLine.textContent = (partial ? `${err.sentCount}개만 올라갔어요. 남은 글만 입력창에 두었어요. ` : "") + errorMessage(err);
+              errLine.textContent = errorMessage(err);
               errLine.hidden = false;
-              submitBtn.disabled = false;
+            } finally {
+              sending = submitBtn.disabled = false;
+              submitBtn.textContent = original;
+              imagePicker?.lock(false);
             }
           },
         },
@@ -1409,46 +1420,26 @@ export function openRelaySheet(
         submitBtn,
       );
 
+      if (imageUploads) {
+        imagePicker = createImagePicker(answerArea, {
+          available: () => true,
+          maxBytes: () => imageMaxBytes,
+          maxEdge: () => imageMaxEdge,
+          active: () => answerArea.isConnected,
+          getDraft: () => draft,
+          setDraft: (value) => { draft = value; },
+          changed: () => { submitBtn.disabled = sending || imagePicker.working; },
+        });
+        form.insertBefore(el("div", { className: "action-row" }, ...imagePicker.buttons), errLine);
+        form.insertBefore(imagePicker.bar, errLine);
+        form.insertBefore(imagePicker.status, errLine);
+      }
       bodyBox.appendChild(form);
     },
   });
 }
 
 /** 새 방 만들기 / 방 이름 바꾸기·삭제 시트 */
-/** 카톡식 전체보기: 말풍선에서 잘린 긴 글을 끝까지 읽고 복사합니다. 본문은 말풍선과 같은 안전 렌더링을 씁니다. */
-export function openMessageSheet(sheets, { sender, when, text, trigger }) {
-  sheets.openSheet({
-    title: "전체 보기",
-    trigger,
-    buildBody: (bodyBox) => {
-      const status = el("p", { className: "field-hint", role: "status", "aria-live": "polite" });
-      const copyBtn = el(
-        "button",
-        {
-          type: "button",
-          className: "btn btn-block",
-          onClick: async () => {
-            try {
-              await navigator.clipboard.writeText(text);
-              status.textContent = "글 전체를 복사했습니다.";
-            } catch {
-              status.textContent = "자동 복사가 되지 않았습니다. 브라우저 권한을 확인해 주세요.";
-            }
-          },
-        },
-        icon("copy", "icon-sm"),
-        "전체 복사",
-      );
-      bodyBox.append(
-        el("p", { className: "field-hint", text: `${sender} · ${when}` }),
-        copyBtn, // 첫 포커스가 맨 위에 오도록 본문보다 앞에 둔다
-        status,
-        buildSafeMessageNodes(text),
-      );
-    },
-  });
-}
-
 export function openRoomCreateSheet(sheets, { trigger, onCreateRoom }) {
   sheets.openSheet({
     title: "새 방 만들기",
@@ -1552,7 +1543,7 @@ export function openRoomManageSheet(sheets, { room, trigger, onRenameRoom, onDel
 
       const delBtn = makeTwoStepButton(
         "이 방 삭제하기",
-        "한 번 더 누르면 방과 대화 즉시 삭제",
+        "한 번 더 누르면 방을 바로 닫고 대화를 삭제합니다",
         "btn btn-danger btn-block",
         async () => {
           try {
@@ -1565,7 +1556,8 @@ export function openRoomManageSheet(sheets, { room, trigger, onRenameRoom, onDel
         },
       );
 
-      bodyBox.append(renameForm, delBtn, errLine);
+      bodyBox.append(renameForm, delBtn, el("p", { className: "field-hint",
+        text: "삭제하면 참가자 접근이 바로 끊깁니다. 대화가 많은 방의 기록과 이미지는 정기 작업에서 나누어 지웁니다." }), errLine);
     },
   });
 }

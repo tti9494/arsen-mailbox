@@ -1,8 +1,10 @@
 import { Refused, SENSITIVE } from "./policy";
+import { MAX_ROOM_PARTICIPANTS } from "./brand";
 
 type Member = { id: string; name: string; ai_type: string | null };
 export type QuestionTarget = { id: string; step: number | null; direct: boolean };
-const ALL_ADDRESSES = new Set(["전체", "다들", "모두", "전원"]);
+const ALL_ADDRESSES = ["전체", "다들", "모두", "전원"];
+const SHORT_ALL_ADDRESSES = ["비서들", "출첵"];
 
 const TYPE_NAMES: Record<string, string[]> = {
   claude: ["클로드"],
@@ -39,12 +41,22 @@ export function routeQuestion(text: string, members: Member[]): QuestionTarget[]
       for (const label of [member.ai_type, ...(TYPE_NAMES[member.ai_type] ?? [])]) addName(aliases, label, member);
     }
   }
-  const labels = [...new Set([...names.keys(), ...aliases.keys(), ...ALL_ADDRESSES])]
+  const shortAll = new Set(SHORT_ALL_ADDRESSES.filter((label) => !names.has(label) && !aliases.has(label)));
+  const allAddresses = new Set([...ALL_ADDRESSES, ...shortAll]);
+  const labels = [...new Set([...names.keys(), ...aliases.keys(), ...allAddresses])]
     .sort((a, b) => b.length - a.length)
     .map(escapeRegExp);
   const token = `@?(${labels.join("|")})(님(?:에게|한테|께)?|에게|한테|께|아|야|이랑|하고|와|과|랑|도)?(?![\\p{L}\\p{N}_])`;
   const prefix = new RegExp(`^\\s*${token}`, "iu");
-  const first = prefix.exec(text);
+  const matchAddress = (clause: string, first = false) => {
+    const match = prefix.exec(clause);
+    if (!match || !shortAll.has(match[1]) || match[0].trimStart().startsWith("@")) return match;
+    // Bare short calls belong at the start, where they cannot turn "부이, 출첵" into a broadcast.
+    const rest = clause.slice(match[0].length);
+    return first && !match[2] && (/^\s*(?:[,，:：]|→|->|[.!?。！？]*$)/u.test(rest) ||
+      (match[1] === "비서들" && /^\s+출첵[.!?。！？]*$/u.test(rest))) ? match : null;
+  };
+  const first = matchAddress(text, true);
   let terms: string[] = [];
   let ordered = false;
   if (first) {
@@ -54,7 +66,7 @@ export function routeQuestion(text: string, members: Member[]): QuestionTarget[]
     while (rest) {
       const separator = /^\s*(→|->|[,，])\s*/u.exec(rest);
       const remaining = separator ? rest.slice(separator[0].length) : rest;
-      const next = prefix.exec(remaining);
+      const next = matchAddress(remaining);
       if (!next || (!separator && !rest.trimStart().startsWith("@") && !/^(?:이랑|하고|와|과|랑)$/u.test(particle ?? ""))) {
         if (separator && /→|->/.test(separator[1])) throw new Refused("question_ambiguous");
         break;
@@ -73,10 +85,10 @@ export function routeQuestion(text: string, members: Member[]): QuestionTarget[]
   } else {
     if (/^\s*@/u.test(text)) throw new Refused("question_ambiguous");
     const matches = text.matchAll(new RegExp(`(?:^|[^\\p{L}\\p{N}_])${token}`, "giu"));
-    terms = [...matches].filter((match) => !ALL_ADDRESSES.has(normalize(match[1])) || match[0].includes("@"))
+    terms = [...matches].filter((match) => !allAddresses.has(normalize(match[1])) || match[0].includes("@"))
       .map((match) => match[1]);
   }
-  if (terms.some((term) => ALL_ADDRESSES.has(normalize(term)))) {
+  if (terms.some((term) => allAddresses.has(normalize(term)))) {
     if (ordered) throw new Refused("question_ambiguous");
     return members.map(({ id }) => ({ id, step: null, direct: false }));
   }
@@ -115,29 +127,68 @@ export type RelayTurn = {
   preceding_reply: string;
 };
 
-export function questionStates(db: D1Database, roomId: string, messageIds: number[], cutoff: number) {
+const AFFECTED_IDS = "SELECT value AS id FROM json_each(?1) UNION " +
+  "SELECT t.question_id FROM json_each(?1) ids CROSS JOIN question_targets t ON t.reply_id=ids.value";
+
+type QuestionRoot = { id: number; asked_at: number; route: string | null };
+type TargetRow = Omit<QuestionState, "asked_at" | "awaiting_previous" | "direct"> & { recorded_reply_id: number | null };
+
+export async function questionContext(db: D1Database, roomId: string, messageIds: number[], cutoff: number) {
+  const page = new Set(messageIds);
+  const roots = await db.prepare("WITH relevant AS MATERIALIZED (" + AFFECTED_IDS + ")" +
+    " SELECT q.id,q.created_at AS asked_at,q.question_route AS route FROM relevant ids" +
+    " CROSS JOIN messages q ON q.id=ids.id WHERE q.room_id=?2 AND q.created_at>?3" +
+    " AND (q.question_route IS NOT NULL OR EXISTS(SELECT 1 FROM question_targets t WHERE t.question_id=q.id))",
+  ).bind(JSON.stringify(messageIds), roomId, cutoff).all<QuestionRoot>();
+  const byId = new Map(roots.results.map((q) => [q.id, { ...q, targets: q.route ? JSON.parse(q.route) as QuestionTarget[] : null }]));
+  // Each target can require its own row and its participant and reply lookups.
+  const rows = roots.meta.rows_read + [...byId.values()].reduce((n, q) => n + 3 + 5 * (q.targets?.length ?? MAX_ROOM_PARTICIPANTS), 0);
+  return { page, byId, rows };
+}
+
+export function questionStates(db: D1Database, roomId: string, questionIds: number[], cutoff: number) {
   return db.prepare(
-    "WITH affected AS (SELECT * FROM question_targets WHERE question_id IN (SELECT value FROM json_each(?1))" +
-      " UNION SELECT * FROM question_targets WHERE reply_id IN (SELECT value FROM json_each(?1)))" +
-      " SELECT t.question_id,t.participant_id,p.name AS participant_name,t.step,q.created_at AS asked_at," +
-      " a.id AS reply_id,a.created_at AS answered_at,EXISTS(SELECT 1 FROM question_targets prior" +
-      " WHERE prior.question_id=t.question_id AND prior.step<t.step AND prior.reply_id IS NULL) AS awaiting_previous," +
-      " EXISTS(SELECT 1 FROM json_each(q.question_route) route WHERE json_extract(route.value,'$.id')=t.participant_id" +
-      " AND json_extract(route.value,'$.direct')=1) AS direct" +
-      " FROM affected t JOIN messages q ON q.id=t.question_id JOIN participants p ON p.id=t.participant_id" +
-      " LEFT JOIN messages a ON a.id=t.reply_id AND a.room_id=q.room_id AND a.created_at>?3" +
-      " WHERE q.room_id=?2 AND q.created_at>?3 ORDER BY t.question_id,t.step,p.created_at,p.rowid",
-  ).bind(JSON.stringify(messageIds), roomId, cutoff);
+    "SELECT t.question_id,t.participant_id,p.name AS participant_name,t.step," +
+      " t.reply_id AS recorded_reply_id,a.id AS reply_id,a.created_at AS answered_at" +
+      " FROM json_each(?1) ids CROSS JOIN question_targets t ON t.question_id=ids.value" +
+      " CROSS JOIN participants p ON p.id=t.participant_id" +
+      " LEFT JOIN messages a ON a.id=t.reply_id AND a.room_id=?2 AND a.created_at>?3" +
+      " ORDER BY t.question_id,t.step,p.created_at,p.rowid",
+  ).bind(JSON.stringify(questionIds), roomId, cutoff);
+}
+
+export function decorateQuestionStates(rows: unknown[], context: Awaited<ReturnType<typeof questionContext>>) {
+  const pending = new Set<number>();
+  const directByQuestion = new Map([...context.byId].map(([id, q]) =>
+    [id, new Set(q.targets?.filter((t) => t.direct).map((t) => t.id))]));
+  const questions: QuestionState[] = [];
+  for (const { recorded_reply_id, ...row } of rows as TargetRow[]) {
+    const awaiting = row.step !== null && row.step > 0 && pending.has(row.question_id);
+    if (row.step !== null && recorded_reply_id === null) pending.add(row.question_id);
+    if (context.page.has(row.question_id) || (recorded_reply_id !== null && context.page.has(recorded_reply_id))) {
+      questions.push({ ...row, asked_at: context.byId.get(row.question_id)!.asked_at,
+        awaiting_previous: awaiting ? 1 : 0, direct: directByQuestion.get(row.question_id)!.has(row.participant_id) ? 1 : 0 });
+    }
+  }
+  return questions;
+}
+
+export const RELAY_ROWS = 80;
+const READY_RELAYS = " FROM question_targets INDEXED BY question_targets_ready" +
+  " WHERE participant_id=?1 AND reply_id IS NULL AND preceding_reply_id IS NOT NULL";
+
+export function hasRelay(db: D1Database, participantId: string) {
+  return db.prepare("SELECT 1" + READY_RELAYS + " LIMIT 1").bind(participantId);
 }
 
 export function relayTurns(db: D1Database, roomId: string, participantId: string, cutoff: number) {
   return db.prepare(
-    "SELECT q.id AS question_id,a.id AS preceding_reply_id,q.body AS question,a.body AS preceding_reply" +
-      " FROM question_targets t JOIN messages q ON q.id=t.question_id" +
-      " JOIN question_targets prior ON prior.question_id=t.question_id AND prior.step=t.step-1" +
-      " JOIN messages a ON a.id=prior.reply_id AND a.room_id=q.room_id" +
-      " WHERE t.participant_id=?1 AND t.reply_id IS NULL AND t.step>1 AND q.room_id=?2" +
-      " AND q.created_at>?3 AND a.created_at>?3 ORDER BY q.id LIMIT 20",
+    "WITH ready AS MATERIALIZED (SELECT question_id,preceding_reply_id" + READY_RELAYS +
+      " ORDER BY question_id DESC LIMIT 20)" +
+      " SELECT q.id AS question_id,a.id AS preceding_reply_id,q.body AS question,a.body AS preceding_reply" +
+      " FROM ready t JOIN messages q ON q.id=t.question_id" +
+      " JOIN messages a ON a.id=t.preceding_reply_id AND a.room_id=q.room_id" +
+      " WHERE q.room_id=?2 AND q.created_at>?3 AND a.created_at>?3 ORDER BY q.id",
   ).bind(participantId, roomId, cutoff);
 }
 

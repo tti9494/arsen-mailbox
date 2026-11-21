@@ -20,7 +20,7 @@ const click = (name) => page.click(`loc=role:button[name='${name}']`);
 const wait = (selector) => page.waitForSelector(selector, { state: "visible", timeout: 8000 });
 const waitText = (text) => page.waitForFunction((value) => document.body.innerText.includes(value), text, { timeout: 8000 });
 const hasKey = (expected) => page.evaluate(
-  async (key) => (await import("/js/keystore.js?v=2.2.2")).getSpaceKey() === key, expected,
+  async (key) => (await import("/js/keystore.js?v=2.3.0")).getSpaceKey() === key, expected,
 );
 const openFirstRoom = async () => {
   await wait(".room-card");

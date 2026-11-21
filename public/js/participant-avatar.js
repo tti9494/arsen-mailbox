@@ -73,4 +73,4 @@ export async function avatarThumbnail(file) {
     bitmap.close();
   }
 }
-import { el } from "./dom.js?v=2.2.2";
+import { el } from "./dom.js?v=2.3.0";

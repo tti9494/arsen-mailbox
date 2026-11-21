@@ -1,4 +1,4 @@
-// Input rules and preview-bot refusal. Same rules as the replaced Python service (src/arsen_ai_os/mailbox/policy.py).
+// Input rules and preview-bot refusal.
 
 import { SPACE_LIMITS } from "./brand";
 
@@ -12,8 +12,7 @@ export class Refused extends Error {
   }
 }
 
-// Families from arsen_ai_os.workspace_metadata._SENSITIVE plus one-time codes, cloud/API tokens and this
-// mailbox's own keys (amk_ participant, amo_ owner, amt_ send ticket).
+// Common secret families plus one-time codes, cloud/API tokens and this mailbox's own keys.
 export const SENSITIVE = new RegExp(
   [
     String.raw`-----BEGIN .*PRIVATE KEY-----`,
@@ -84,8 +83,10 @@ export const LIMITS: Record<string, [number, number]> = {
   read: [20, 60], // per participant
   send: [6, 60], // per participant
   send_day: [200, 86400], // per participant
+  image_upload: [2, 60], // successful attachments per participant
   auth_fail: [30, 60], // per source address (hashed)
+  auth_fail_day: [300, 86400], // also bound one source’s daily reserve
   space: [60, 60],
-  space_day: [5000, 86400],
+  space_day: [10_000, 86400],
   admin: [60, 60], // per owner
 };

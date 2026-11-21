@@ -4,7 +4,7 @@
 // - 공간 키는 Authorization: Bearer ams_... 헤더로만, 참가자 키는 X-Mailbox-Key: amk_... 헤더로만 전달
 // - 쿼리·본문·오류 객체·콘솔에 열쇠 원문을 절대 남기지 않음
 
-import { DEFINITIVE_ERRORS } from "./constants.js?v=2.2.2";
+import { DEFINITIVE_ERRORS } from "./constants.js?v=2.3.0";
 
 export class ApiError extends Error {
   constructor(code, status = 0, retryAfter = null, definitive = false) {
@@ -32,14 +32,14 @@ export function isAuthRefusal(err) {
 
 export async function apiRequest(
   path,
-  { method = "GET", body = undefined, spaceKey = null, participantKey = null } = {},
+  { method = "GET", body = undefined, spaceKey = null, participantKey = null, image, caption, relayedFor, asBlob } = {},
 ) {
   if (typeof navigator !== "undefined" && navigator.onLine === false) {
     throw new ApiError("offline", 0, null, false);
   }
 
   const headers = new Headers();
-  headers.set("accept", "application/json");
+  headers.set("accept", asBlob ? "image/png, image/jpeg, image/webp" : "application/json");
 
   if (spaceKey && participantKey) {
     throw new ApiError("invalid", 400, null, false);
@@ -51,7 +51,12 @@ export async function apiRequest(
   }
 
   let serialized;
-  if (body !== undefined && method !== "GET" && method !== "HEAD") {
+  if (image instanceof Blob && method === "POST") {
+    headers.set("content-type", image.type);
+    if (caption) headers.set("x-mailbox-text", encodeURIComponent(caption));
+    if (relayedFor) headers.set("x-mailbox-relayed-for", relayedFor);
+    serialized = image;
+  } else if (body !== undefined && method !== "GET" && method !== "HEAD") {
     headers.set("content-type", "application/json");
     serialized = JSON.stringify(body);
   }
@@ -75,6 +80,12 @@ export async function apiRequest(
   // HTTP 401 / 403은 응답 본문 형식과 무관하게 무조건 확정 거절 처리
   const statusDefinitive = res.status === 401 || res.status === 403;
 
+  if (res.ok && asBlob) {
+    if (!["image/png", "image/jpeg", "image/webp"].includes(res.headers.get("content-type")))
+      throw new ApiError("image_invalid", res.status);
+    return res.blob();
+  }
+
   let data = null;
   try {
     data = await res.json();
@@ -96,10 +107,15 @@ export async function apiRequest(
                 ? "key_epoch_invalid"
                 : "invalid";
 
+    const imageScopes = ["site_storage", "space_storage", "site_daily", "space_daily", "participant_minute"];
     const code = statusDefinitive
       ? res.status === 401
         ? "unauthorized"
         : "forbidden"
+      : data?.error === "quota" && ["service_day", "space_day", "space_operation", "space_posts"].includes(data.scope)
+        ? data.scope + "_quota"
+      : ["quota", "rate_limited"].includes(data?.error) && imageScopes.includes(data.scope)
+        ? "image_" + data.scope
       : typeof data?.error === "string"
         ? data.error
         : fallbackCode;
@@ -111,7 +127,11 @@ export async function apiRequest(
         ? retryHeader
         : null;
 
-    throw new ApiError(code, res.status, retryAfter, statusDefinitive);
+    const error = new ApiError(code, res.status, retryAfter, statusDefinitive);
+    if (Number.isSafeInteger(data?.image_max_bytes) && data.image_max_bytes > 0) error.imageMaxBytes = data.image_max_bytes;
+    if (Number.isSafeInteger(data?.image_max_edge) && data.image_max_edge > 0) error.imageMaxEdge = data.image_max_edge;
+    if (code === "space_posts_quota" && Number.isSafeInteger(data.limit) && data.limit > 0) error.postLimit = data.limit;
+    throw error;
   }
 
   return data ?? {};

@@ -1,4 +1,4 @@
-// Run from mailbox-worker. All account data and the migration output live in a fresh private temp directory.
+// Run from the repository root. All account data and the migration output live in a fresh private temp directory.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -94,6 +94,8 @@ try {
     state,
     "--log-level",
     "error",
+    "--var",
+    "IMAGE_UPLOADS:on",
     "--show-interactive-dev-session",
     "false",
   ]);
@@ -121,7 +123,8 @@ try {
     assert.equal(response.status, status, method + " " + path);
     return response.json();
   }
-  const release = "?v=2.2.2";
+  const release = "?v=2.3.0";
+  const appEntry = "/js/app.js" + release + "&history=2&maintenance=1";
   for (const path of ["/", "/app", "/app/", "/app/legacy/", "/r/legacy/", "/r/legacy", "/help.html"]) {
     const r = await fetch(base + path, { redirect: "manual" });
     assert.equal(r.status, 200, "asset " + path);
@@ -130,19 +133,19 @@ try {
     assert.ok(r.headers.get("content-security-policy").includes("frame-ancestors 'none'"));
     const html = await r.text();
     const help = path === "/help.html";
-    const entry = help ? "/js/help-init.js" : "/js/app.js";
-    assert.ok(html.includes("아르센 우편함") && html.includes('src="' + entry + release + '"'));
+    const entry = help ? "/js/help-init.js" + release : appEntry.replaceAll("&", "&amp;");
+    assert.ok(html.includes("아르센 우편함") && html.includes('src="' + entry + '"'));
     const styles = help ? ["tokens", "styles"] : ["tokens", "styles", "chat-skins"];
     for (const style of styles) assert.ok(html.includes('href="/css/' + style + '.css' + release + '"'));
     if (!help) assert.match(html, /name="turnstile-sitekey" content="1x00000000000000000000AA"/);
   }
-  const modules = new Set(["/js/app.js" + release, "/js/help-init.js" + release]);
+  const modules = new Set([appEntry, "/js/help-init.js" + release]);
   for (const path of modules) {
     const r = await fetch(base + path);
     assert.equal(r.status, 200, path);
     for (const [, specifier] of (await r.text()).matchAll(/\bfrom\s+"(\.[^"]+)"/g)) {
-      assert.ok(specifier.endsWith(release), path + " imports " + specifier);
       const target = new URL(specifier, base + path);
+      assert.equal(target.search, release + (target.pathname === "/js/sheets.js" ? "&history=2&maintenance=1" : ""), path + " imports " + specifier);
       modules.add(target.pathname + target.search);
     }
   }
@@ -184,6 +187,19 @@ try {
   assert.equal(read.messages.length, 3);
   assert.equal(read.messages[1].relay_label, "사용자가 대신 올림");
   await api(path + "/messages", "GET", p.key, undefined, 429);
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAYAAACddGYaAAAAHElEQVR42mOUbGr6zwAFTAwMDAzP6+oYGRgYGAA+KgQEG4yYOQAAAABJRU5ErkJggg==", "base64");
+  const uploaded = await fetch(base + "/r/" + room_id + "/image", {
+    method: "POST",
+    headers: { "x-mailbox-key": p.key, "content-type": "image/png", "x-mailbox-text": encodeURIComponent("이미지 확인") },
+    body: png,
+  });
+  assert.equal(uploaded.status, 200, "local binary image upload");
+  const imagePath = path + "/image/" + (await uploaded.json()).id;
+  assert.equal((await fetch(base + imagePath)).status, 401, "image cannot be read without its room key");
+  const image = await fetch(base + imagePath, { headers: { authorization: "Bearer " + owner.key } });
+  assert.equal(image.status, 200);
+  assert.equal(image.headers.get("cache-control"), "private, no-store");
+  assert.deepEqual(Buffer.from(await image.arrayBuffer()), png);
   const next = await api(path + "/participants/" + p.participant_id + "/reissue", "POST", owner.key);
   keys.push(next.key);
   await api(path + "/participants/" + p.participant_id + "/revoke", "POST", owner.key);
@@ -191,7 +207,7 @@ try {
   await api("/api/me", "DELETE", owner.key, { confirm: "삭제" });
   await api("/api/me", "GET", owner.key, undefined, 403);
   console.log(
-    "PASS local Wrangler assets, v1-to-v2 migration, immediate assistant read, empty throttle, relay, reissue, revoke and delete",
+    "PASS local Wrangler assets, v1-to-v2 migration, immediate assistant read, empty throttle, relay, private images, reissue, revoke and delete",
   );
   if (process.argv.includes("--siteverify")) {
     const s = await api("/api/spaces", "POST", undefined, { invite, turnstile: "XXXX.DUMMY.TOKEN.XXXX" });

@@ -1,18 +1,35 @@
 // This Worker's only data binding is its own D1 database. It never logs URLs, query strings, headers or bodies.
 
-import { SPACE_LIMITS } from "./brand";
-import { dayCount, dayStart, countRequest } from "./budget";
+import { MAX_ROOM_PARTICIPANTS, SPACE_LIMITS } from "./brand";
+import {
+  addWriteEstimate, budgetGuard, DailyCapacity, dayCount, dayStart,
+  pollCharge, recentCapacity, refreshCapacityOnRefusal, requireCapacity, spaceDailyWriteLimit, SLOW_READS, STOP_MUTATIONS, STOP_TRAFFIC,
+} from "./budget";
+import { minute, participantReadGuard, spaceLimit, spaceReadHeadroom, takeParticipantRead, takeSpaceLimit, type SpaceReadUsage } from "./traffic";
+import { reusableTicket, verifyReusableTicket } from "./send-confirmation";
 import { requireSql, refusal } from "./transaction";
+import { rejectRecentlyDenied, rememberDenied } from "./auth-window";
 import { api, apiError, serveAsset } from "./v2";
 import { assistantText, humanLink } from "./guide";
 import { cleanName, cleanText, isPreviewBot, LIMITS, Refused } from "./policy";
-import { questionStates, relayTurns, routeQuestion, safeExcerpt, type QuestionState, type RelayTurn } from "./questions";
-import { retentionCutoff, retentionGuard, SECONDS_PER_DAY } from "./retention";
+import {
+  decorateQuestionStates, hasRelay, questionContext, questionStates, RELAY_ROWS, relayTurns,
+  routeQuestion, safeExcerpt, type QuestionState, type RelayTurn,
+} from "./questions";
+import { HISTORY_PAGE, historyScan, historyTail, historyWindow, retentionCutoff, retentionGuard } from "./retention";
+import { maintain } from "./maintenance";
+import { decodeImageBase64, imageInputLimit, imageJsonLimit, inspectImage, readImageInput, type ImageData } from "./image-data";
+import {
+  attachImageSummary, imageBudget, imageDigest, imageLimit, ImageLimit, IMAGE_SUMMARY_SQL,
+  IMAGE_WRITE_RESERVE, imageUploadsOn, imageUsageLimits, loadImage, saveImage, type ImageSettings,
+} from "./images";
 
-export interface Env {
+export interface Env extends ImageSettings {
   DB: D1Database;
   ASSETS?: Fetcher;
+  IMAGE_UPLOADS?: string;
   SIGNUP_OPEN?: string;
+  SPACE_DAILY_WRITE_LIMIT?: string;
   TURNSTILE_SITEKEY?: string;
   TURNSTILE_SECRET?: string;
   SOURCE_HASH_KEY?: string;
@@ -31,9 +48,7 @@ export const RETENTION_SECONDS = 30 * 86400;
 export const TICKET_SECONDS = 30 * 60;
 const TICKETS_PER_PARTICIPANT = 5;
 const DUPLICATE_WINDOW = 10 * 60;
-const READ_LIMIT = 50;
-// Room for message_bytes of text plus JSON escaping and the other fields.
-const MAX_BODY = 32 * 1024;
+const MAX_BODY = 16 * 1024;
 const MAX_URL = 16 * 1024; // Cloudflare refuses longer URLs before the Worker anyway
 
 export const SECURITY_HEADERS: Record<string, string> = {
@@ -76,6 +91,11 @@ const STATUS: Record<string, number> = {
   bad_request: 400,
   not_found: 404,
   method_not_allowed: 405,
+  image_invalid: 400,
+  image_unsupported: 415,
+  image_too_large: 413,
+  image_dimensions: 413,
+  image_disabled: 503,
   internal: 500,
 };
 
@@ -85,7 +105,7 @@ const HINT: Record<string, string> = {
   preview_refused: "링크 미리보기 요청은 받지 않습니다.",
   rate_limited: "요청이 너무 잦습니다. 잠시 뒤에 다시 하세요.",
   text_missing: "보낼 본문(text)이 없습니다.",
-  text_too_long: `본문은 ${SPACE_LIMITS.message_chars}자까지입니다. 더 길면 나눠서 보내세요.`,
+  text_too_long: "본문은 2000자까지입니다.",
   text_invalid: "본문에 쓸 수 없는 문자가 있습니다.",
   text_sensitive: "비밀번호·인증번호·키처럼 보이는 내용은 보낼 수 없습니다.",
   ticket_missing: "GET으로 쓸 때는 방을 먼저 읽고 c(확인값)를 붙여야 합니다.",
@@ -146,6 +166,14 @@ function retry(e: Refused) {
   return response;
 }
 
+export function dailyCapacityResponse(reason: DailyCapacity, asPlain = false) {
+  const response = asPlain
+    ? plain("error: quota\n" + reason.notice + "\n", 429)
+    : json({ error: "quota", scope: reason.scope, message: reason.notice, retry_after: reason.retryAfter, limit: reason.postLimit }, 429);
+  if (reason.retryAfter !== undefined) response.headers.set("retry-after", String(reason.retryAfter));
+  return response;
+}
+
 const escapeHtml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 const WHEN = new Intl.DateTimeFormat("sv-SE", {
@@ -160,9 +188,9 @@ const WHEN = new Intl.DateTimeFormat("sv-SE", {
 const when = (epoch: number) => WHEN.format(new Date(epoch * 1000));
 const kindLabel = (kind: string) => (kind === "human" ? "사람" : "비서");
 
-export async function readBody(request: Request): Promise<Record<string, unknown>> {
+export async function readBody(request: Request, maximum = MAX_BODY): Promise<Record<string, unknown>> {
   const declared = request.headers.get("content-length");
-  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_BODY)) {
+  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > maximum)) {
     throw new Refused("body_too_large");
   }
   if (!request.body) return {};
@@ -173,7 +201,7 @@ export async function readBody(request: Request): Promise<Record<string, unknown
     const { done, value } = await reader.read();
     if (done) break;
     size += value.byteLength;
-    if (size > MAX_BODY) {
+    if (size > maximum) {
       await reader.cancel();
       throw new Refused("body_too_large");
     }
@@ -194,6 +222,7 @@ export async function readBody(request: Request): Promise<Record<string, unknown
   }
   const kind = (request.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
   if (kind === "application/x-www-form-urlencoded") {
+    if (size > MAX_BODY) throw new Refused("body_too_large");
     return Object.fromEntries(new URLSearchParams(text));
   }
   let data: unknown;
@@ -203,6 +232,7 @@ export async function readBody(request: Request): Promise<Record<string, unknown
     throw new Refused("bad_request");
   }
   if (typeof data !== "object" || data === null || Array.isArray(data)) throw new Refused("bad_request");
+  if (size > MAX_BODY && !Object.hasOwn(data, "image_base64")) throw new Refused("body_too_large");
   return data as Record<string, unknown>;
 }
 
@@ -214,7 +244,7 @@ function replyId(value: unknown): number | null {
 }
 
 // ---- rate limits (D1 fixed windows) ---------------------------------------------------------------
-function rateHit(env: Env, bucket: string, subject: string, now: number) {
+export function rateHit(env: Env, bucket: string, subject: string, now: number) {
   const [limit, window] = LIMITS[bucket];
   const start = Math.floor(now / window) * window;
   // At the limit the conditional update writes nothing and returns no row: refused, and no D1 write spent.
@@ -225,8 +255,28 @@ function rateHit(env: Env, bucket: string, subject: string, now: number) {
     .bind(bucket, subject, start, limit);
 }
 
-export async function allow(env: Env, bucket: string, subject: string): Promise<boolean> {
-  return (await rateHit(env, bucket, subject, nowSeconds()).first()) !== null;
+export async function allow(env: Env, bucket: string, subject: string, cost = 6, ceiling = STOP_TRAFFIC): Promise<boolean> {
+  const now = nowSeconds();
+  const day = now - now % 86400;
+  const perSource = bucket === "auth_fail";
+  const charge = perSource ? 12 : cost;
+  const guards = perSource ? [requireSql(env.DB, "rate_limited", dayCount + "<?",
+    "auth_fail_day", subject, day, LIMITS.auth_fail_day[0])] : [];
+  const sourceDay = perSource ? [env.DB.prepare(
+    "INSERT INTO rate_hits(bucket,subject,window_start,count) SELECT 'auth_fail_day',?,?,1 WHERE changes()=1" +
+      " ON CONFLICT(bucket,subject,window_start) DO UPDATE SET count=count+1",
+  ).bind(subject, day)] : [];
+  try {
+    const result = await env.DB.batch([
+      ...guards, budgetGuard(env.DB, day, ceiling, charge), rateHit(env, bucket, subject, now),
+      ...sourceDay, addWriteEstimate(env.DB, day, charge, true),
+    ]);
+    return result[guards.length + 1].results.length !== 0;
+  } catch (e) {
+    const reason = refusal(e);
+    if (reason?.code === "rate_limited") return false;
+    throw reason ?? e;
+  }
 }
 
 /** Read-only check, so a source already over its failure limit costs no key lookup and no write. */
@@ -237,6 +287,12 @@ export async function exhausted(env: Env, bucket: string, subject: string): Prom
     .bind(bucket, subject, start)
     .first<{ count: number }>();
   return row !== null && row.count >= limit;
+}
+
+export async function authFailureDelay(env: Env, source: string) {
+  const now = nowSeconds();
+  const window = await exhausted(env, "auth_fail_day", source) ? 86400 : 60;
+  return window - now % window;
 }
 
 /** KEY_EPOCH must be set explicitly to a decimal and must not be lower than the highest epoch already used
@@ -291,7 +347,7 @@ export async function sourceOf(request: Request, env: Env): Promise<string> {
 }
 
 // ---- participants ------------------------------------------------------------------------------------
-export interface Participant {
+export interface Participant extends SpaceReadUsage {
   space_id: string | null;
   retention_days: number | null;
   retention_rev: number;
@@ -299,11 +355,22 @@ export interface Participant {
   id: string;
   room_id: string;
   room_name: string;
+  room_owner: string;
+  image_revision: number;
+  delivery: string;
   name: string;
   kind: string;
   last_read_id: number;
+  last_read_at: number | null;
+  read_guard_at: number | null;
+  cooldown_armed: number;
+  read_minute: number;
+  read_count: number;
+  scan_next_id: number;
+  scan_next_rev: number;
   key_hash: string;
   key_epoch: number;
+  ticket_generation: number;
 }
 
 /** SQL condition: the credential this request authenticated with is still the participant's live one.
@@ -317,33 +384,46 @@ export async function authenticate(
   roomId: string,
   key: string | null,
   bucket: "read" | "send",
+  deferRead = false,
+  readCost = 2,
 ): Promise<Participant> {
   if (isPreviewBot(request.headers)) throw new Refused("preview_refused");
-  const epoch = await currentEpoch(env);
   const source = await sourceOf(request, env);
+  const now = nowSeconds();
+  const hash = key ? await sha256hex(key) : "";
+  const credential = roomId + ":" + hash;
+  rejectRecentlyDenied(env.DB, source, credential, now);
+  const epoch = await currentEpoch(env);
   if (await exhausted(env, "auth_fail", source)) throw new Refused("rate_limited");
   if (!key) {
-    if (!(await allow(env, "auth_fail", source))) throw new Refused("rate_limited");
+    if (!(await allow(env, "auth_fail", source))) {
+      rememberDenied(env.DB, source, credential, nowSeconds());
+      throw new Refused("rate_limited");
+    }
     throw new Refused("key_missing");
   }
   const who = await env.DB.prepare(
-    "SELECT p.id, p.room_id, r.name AS room_name, p.name, p.kind, p.last_read_id, p.key_hash, p.key_epoch, s.id AS space_id," +
+    "SELECT p.id, p.room_id, r.name AS room_name,r.owner_id AS room_owner,r.image_revision,p.delivery,p.name, p.kind, p.last_read_id,p.scan_next_id,p.scan_next_rev," +
+      " p.last_read_at,p.read_guard_at,p.cooldown_armed,p.read_minute,p.read_count,p.key_hash,p.key_epoch,p.ticket_generation," +
+      " s.id AS space_id,s.request_day,s.request_count,s.request_write_estimate,s.request_minute,s.request_minute_count," +
       " CASE WHEN s.id IS NULL THEN 30 ELSE s.retention_days END AS retention_days,COALESCE(s.retention_rev,0) AS retention_rev" +
       " FROM participants p JOIN rooms r ON r.id = p.room_id LEFT JOIN spaces s ON s.id=r.owner_id" +
       " WHERE (s.id IS NULL OR s.status='active') AND p.is_owner=0 AND p.key_hash = ? AND p.revoked = 0 AND p.key_epoch = ?",
   )
-    .bind(await sha256hex(key), epoch)
+    .bind(hash, epoch)
     .first<Participant>();
   // wrong key, revoked key, old-epoch key and another room's key look the same from outside
   if (!who || who.room_id !== roomId) {
-    if (!(await allow(env, "auth_fail", source))) throw new Refused("rate_limited");
+    if (!(await allow(env, "auth_fail", source))) {
+      rememberDenied(env.DB, source, credential, nowSeconds());
+      throw new Refused("rate_limited");
+    }
     throw new Refused("forbidden");
   }
-  if (who.space_id && !(await allow(env, "space_day", who.space_id))) throw new Refused("rate_limited");
-  // Space assistant reads spend the participant budget only if the read transaction passes the cooldown.
-  if (!(bucket === "read" && who.space_id && who.kind === "assistant") && !(await allow(env, bucket, who.id)))
-    throw new Refused("rate_limited");
-  if (bucket === "send" && !(await allow(env, "send_day", who.id))) throw new Refused("rate_limited");
+  if (bucket === "read") {
+    if (!deferRead) await takeParticipantRead(env.DB, who.id, nowSeconds(), who.space_id,
+      spaceDailyWriteLimit(env.SPACE_DAILY_WRITE_LIMIT), readCost);
+  }
   return who;
 }
 
@@ -357,6 +437,7 @@ interface Message {
   body: string;
   created_at: number;
   reply_to: number | null;
+  image?: { mime: string; bytes: number; width: number; height: number };
 }
 
 /** Reads a page, then in ONE batch issues a ticket and moves the read position, both only while the
@@ -367,27 +448,90 @@ export async function readWithTicket(
   who: Participant,
   since: number | null,
   withTicket = true,
-): Promise<[Message[], boolean, string, QuestionState[], RelayTurn[]]> {
-  const start = since ?? who.last_read_id;
+  before?: number,
+): Promise<[Message[], boolean, string, QuestionState[], RelayTurn[], number, number | null]> {
+  const resume = who.scan_next_rev === who.retention_rev && who.scan_next_id > who.last_read_id ? who.scan_next_id : 0;
+  const requestedStart = before ?? since ?? Math.max(who.last_read_id, resume);
   const now = nowSeconds();
   const cutoff = retentionCutoff(who.retention_days, now);
-  const { results } = await env.DB.prepare(
-    "SELECT m.id, COALESCE(a.name,p.name) AS sender, COALESCE(a.kind,p.kind) AS sender_kind, COALESCE(a.ai_type,p.ai_type) AS ai_type, m.participant_id, m.relayed_for, m.body, m.created_at, m.reply_to FROM messages m" +
-      " JOIN participants p ON p.id = m.participant_id LEFT JOIN participants a ON a.id=m.relayed_for" +
-      " WHERE m.room_id = ?4 AND m.id > ?5 AND m.created_at > ?6 AND " +
-      STILL_VALID +
-      " ORDER BY m.id LIMIT ?7",
-  )
-    .bind(who.id, who.key_hash, who.key_epoch, who.room_id, start, cutoff, READ_LIMIT + 1)
-    .all<Message>();
-  const more = results.length > READ_LIMIT;
-  const page = results.slice(0, READ_LIMIT);
-  const limited = who.space_id !== null && who.kind === "assistant";
-  const freshHumanId = limited ? (page.findLast((m) => m.sender_kind === "human" && m.relayed_for === null)?.id ?? 0) : 0;
-  const ticket = withTicket ? "amt_" + token(16) : "";
   const db = env.DB;
+  const { estimate, active_spaces } = await recentCapacity(db, now);
+  if (estimate >= STOP_TRAFFIC) throw new DailyCapacity(now);
+  const limited = who.space_id !== null && who.kind === "assistant";
+  const allocation = spaceDailyWriteLimit(env.SPACE_DAILY_WRITE_LIMIT);
+  const reusable = withTicket && who.space_id !== null && Boolean(env.SOURCE_HASH_KEY?.trim());
+  const minimum = Math.max(pollCharge(active_spaces, 0), withTicket && !reusable ? 16 : 0);
+  const checkLive = estimate >= STOP_MUTATIONS;
+  if (checkLive) await requireCapacity(db, STOP_TRAFFIC, minimum);
+  if (!who.space_guard && who.read_minute === minute(now) && who.read_count >= LIMITS.read[0])
+    throw new Refused("rate_limited", 60 - now % 60);
+  const spaceRemaining = who.space_id ? spaceReadHeadroom(who, now, Boolean(who.space_guard), allocation, minimum) : Infinity;
+  if (STOP_TRAFFIC - estimate < minimum) throw new DailyCapacity(now);
+  // Near the ceiling bound the cost even when the exact quote is rejected by the transaction.
+  const size = Math.min(spaceRemaining, STOP_TRAFFIC - estimate) < 300 ? 4 : HISTORY_PAGE;
+  const seek = size === HISTORY_PAGE;
+  const backward = before !== undefined;
+  const cooldown = estimate >= SLOW_READS ? 300 : SPACE_LIMITS.assistant_read_seconds;
+  const guardedAt = who.read_guard_at ?? who.last_read_at;
+  const cooling = limited && who.cooldown_armed && guardedAt !== null && guardedAt + cooldown > now &&
+    !(resume && requestedStart === resume);
+  // A busy reader may catch up during cooldown, but cannot replay pages it has already received.
+  const start = cooling ? Math.max(requestedStart, who.last_read_id, resume) : requestedStart;
+  let indexedHumanId = 0;
+  if (cooling) {
+    const newest = await db.prepare("SELECT id,created_at FROM messages WHERE room_id=? AND human_origin=1 AND id>? ORDER BY id DESC LIMIT 1")
+      .bind(who.room_id, start).first<{ id: number; created_at: number }>();
+    if (!newest || newest.created_at <= cutoff) throw new Refused("rate_limited", guardedAt + cooldown - now);
+    indexedHumanId = newest.id;
+  }
+  const window = backward ? historyTail("?4", "?5", "?6", "?7", size, seek) :
+    historyScan("?4", "?5", "?6", "?7", undefined, size, seek);
+  const { results, meta } = await env.DB.prepare(
+    "WITH " + window + " SELECT scanned_count,scan_end," +
+      (backward ? "(SELECT COALESCE(MAX(id),0) FROM messages WHERE room_id=?4)" : "NULL") + " AS latest_id," +
+      " m.id,COALESCE(a.name,p.name) AS sender," +
+      " COALESCE(a.kind,p.kind) AS sender_kind,COALESCE(a.ai_type,p.ai_type) AS ai_type," +
+      " (m.question_route IS NOT NULL OR m.reply_to IS NOT NULL OR" +
+      " EXISTS(SELECT 1 FROM question_targets t WHERE t.question_id=m.id)) AS question_related," +
+      " m.participant_id,m.relayed_for,m.body,m.created_at,m.reply_to," + IMAGE_SUMMARY_SQL + " FROM scanned_range" +
+      " LEFT JOIN retained h ON 1 LEFT JOIN messages m ON m.id=h.id" +
+      " LEFT JOIN message_images i ON i.message_id=m.id" +
+      " LEFT JOIN participants p ON p.id=m.participant_id LEFT JOIN participants a ON a.id=m.relayed_for" +
+      " WHERE " + STILL_VALID + " ORDER BY m.id",
+  )
+    .bind(who.id, who.key_hash, who.key_epoch, who.room_id, start, cutoff, ...(seek ? [now] : []))
+    .all<Message & Parameters<typeof attachImageSummary>[0] & { scanned_count: number; scan_end: number; latest_id: number | null; question_related: number }>();
+  const info = results[0];
+  const messages = results.filter(({ id }) => id !== null)
+    .map(({ scanned_count, scan_end, latest_id, ...message }) => attachImageSummary(message));
+  const forward = historyWindow(messages, info?.scanned_count ?? 0, info?.scan_end ?? start, start, size);
+  const selected = backward ? messages.slice(-size) : forward.page;
+  const previous = backward && info && info.scanned_count > size ?
+    (messages.length > size ? selected[0].id : info.scan_end) : null;
+  const next = backward ? info?.latest_id ?? 0 : forward.next;
+  const more = !backward && forward.more;
+  const ids = selected.filter(({ question_related }) => question_related).map(({ id }) => id);
+  const page = selected.map(({ question_related, ...message }) => message);
+  const delivered = page.at(-1)?.id ?? 0;
+  const scanNext = more && next > Math.max(start, delivered) ? next : 0;
+  const updateScan = !backward && (scanNext > 0 || (resume > 0 && start >= resume));
+  const freshHumanId = limited ? (page.findLast((m) => m.sender_kind === "human" && m.relayed_for === null)?.id ?? 0) : 0;
+  const progress = Math.max(delivered, scanNext);
+  const catchingUp = indexedHumanId > delivered && more && progress > start;
+  if (cooling && freshHumanId <= who.last_read_id && !catchingUp)
+    throw new Refused("rate_limited", guardedAt + cooldown - now);
+  const context = who.space_id && ids.length ? await questionContext(db, who.room_id, ids, cutoff) : null;
+  const relay = limited && Boolean(await hasRelay(db, who.id).first());
+  const storedTicket = withTicket && !reusable ? "amt_" + token(16) : "";
   const statements = who.space_guard ? [who.space_guard] : [];
   statements.push(requireSql(db, "forbidden", STILL_VALID, who.id, who.key_hash, who.key_epoch));
+  const costForReads = pollCharge(active_spaces, meta.rows_read + (checkLive ? active_spaces + 2 : 0) +
+    (cooling ? 2 : 0) + (catchingUp ? 3 : 0) +
+    (context?.rows ?? 0) + (relay ? RELAY_ROWS : 0));
+  const readCost = storedTicket ? Math.max(costForReads, 16) : costForReads;
+  const scope = who.space_id ? spaceLimit(db, who.space_id, now, Boolean(who.space_guard), readCost, STOP_TRAFFIC, allocation) : null;
+  if (!scope) statements.push(budgetGuard(db, dayStart(), STOP_TRAFFIC, readCost));
+  else if (estimate >= SLOW_READS) statements.push(...scope.guards);
   if (who.space_id) {
     statements.push(requireSql(db, "forbidden", "EXISTS(SELECT 1 FROM spaces WHERE id=? AND status='active')",
       who.space_id));
@@ -398,31 +542,48 @@ export async function readWithTicket(
     // or consume the one-time first-empty-read grace more than once.
     statements.push(
       requireSql(db, "rate_limited",
-        "EXISTS(SELECT 1 FROM participants WHERE id=? AND (cooldown_armed=0 OR last_read_at IS NULL OR last_read_at<=? OR last_read_id<?))",
-        who.id, now - SPACE_LIMITS.assistant_read_seconds, freshHumanId),
-      rateHit(env, "read", who.id, now),
-      requireSql(db, "rate_limited", "changes()=1"),
+        "EXISTS(SELECT 1 FROM participants WHERE id=? AND (cooldown_armed=0 OR COALESCE(read_guard_at,last_read_at) IS NULL" +
+          " OR COALESCE(read_guard_at,last_read_at)<=? OR last_read_id<?" +
+          " OR (scan_next_id=? AND scan_next_rev=? AND scan_next_id>last_read_id)" +
+          " OR (? AND MAX(last_read_id,CASE WHEN scan_next_rev=? THEN scan_next_id ELSE 0 END)<?" +
+          " AND EXISTS(SELECT 1 FROM messages WHERE id=? AND room_id=? AND human_origin=1 AND created_at>?))))",
+        who.id, now - cooldown, freshHumanId, start, who.retention_rev,
+        catchingUp ? 1 : 0, who.retention_rev, progress, indexedHumanId, who.room_id, cutoff),
     );
   }
-  if (withTicket) statements.push(
+  if (!who.space_guard) statements.push(participantReadGuard(db, who.id, now));
+  if (scope) {
+    if (estimate < SLOW_READS) statements.push(...scope.guards);
+    statements.push(...scope.updates);
+  }
+  if (storedTicket) statements.push(
     db.prepare("DELETE FROM send_tickets WHERE participant_id = ? AND created_at <= ?").bind(who.id, now - TICKET_SECONDS),
     db.prepare("INSERT INTO send_tickets (ticket_hash, participant_id, created_at) VALUES (?,?,?)")
-      .bind(await sha256hex(ticket), who.id, now),
+      .bind(await sha256hex(storedTicket), who.id, now),
     db.prepare("DELETE FROM send_tickets WHERE participant_id = ? AND rowid NOT IN (SELECT rowid FROM send_tickets" +
       " WHERE participant_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?)")
       .bind(who.id, who.id, TICKETS_PER_PARTICIPANT),
   );
-  statements.push(
+  const activityIndex = statements.push(
     db.prepare(
       "UPDATE participants SET cooldown_armed=CASE WHEN first_read_at IS NULL AND ?4=0 THEN 0 ELSE 1 END," +
-        "last_read_id=MAX(last_read_id,?1),first_read_at=COALESCE(first_read_at,?2)," +
-        "last_read_at=MAX(COALESCE(last_read_at,?2),?2) WHERE id=?3",
-    ).bind(page.at(-1)?.id ?? 0, now, who.id, page.length),
-  );
-  const questionIndex = who.space_id && page.length ? statements.push(
-    questionStates(db, who.room_id, page.map(({ id }) => id), cutoff),
+        "read_guard_at=CASE WHEN ?5 THEN MAX(COALESCE(read_guard_at,?2),?2) ELSE read_guard_at END," +
+        "read_count=CASE WHEN ?5 THEN (CASE WHEN read_minute=?6 THEN read_count+1 ELSE 1 END) ELSE read_count END," +
+        "read_minute=CASE WHEN ?5 THEN ?6 ELSE read_minute END," +
+        "scan_next_id=CASE WHEN ?9 AND (?10<>scan_next_rev OR scan_next_id<=?11) THEN ?8 ELSE scan_next_id END," +
+        "scan_next_rev=CASE WHEN ?9 THEN ?10 ELSE scan_next_rev END," +
+        "last_read_at=CASE WHEN last_read_at IS NULL OR last_read_id<?1 OR last_read_at<=?7 THEN MAX(COALESCE(last_read_at,?2),?2) ELSE last_read_at END," +
+        "last_read_id=MAX(last_read_id,?1),first_read_at=COALESCE(first_read_at,?2)" +
+        " WHERE id=?3 AND (?5 OR last_read_at IS NULL OR last_read_id<?1 OR last_read_at<=?7 OR ?9) RETURNING ticket_generation",
+    ).bind(delivered, now, who.id, page.length, who.space_guard ? 0 : 1,
+      minute(now), estimate >= STOP_MUTATIONS ? -1 : now - (who.space_guard ? 900 : 180),
+      scanNext, updateScan ? 1 : 0, who.retention_rev, Math.max(start, scanNext)),
+  ) - 1;
+  if (!who.space_id) statements.push(addWriteEstimate(db, dayStart(), readCost));
+  const questionIndex = context?.byId.size ? statements.push(
+    questionStates(db, who.room_id, [...context.byId.keys()], cutoff),
   ) - 1 : -1;
-  const turnIndex = limited ? statements.push(
+  const turnIndex = relay ? statements.push(
     relayTurns(db, who.room_id, who.id, cutoff),
   ) - 1 : -1;
   let resultsByStatement;
@@ -432,18 +593,19 @@ export async function readWithTicket(
     const reason = refusal(e);
     if (reason?.code === "rate_limited") {
       const activity = await db.prepare(
-        "SELECT last_read_id,last_read_at,cooldown_armed FROM participants WHERE id=?1 AND key_hash=?2 AND revoked=0 AND key_epoch=?3",
+        "SELECT last_read_id,COALESCE(read_guard_at,last_read_at) AS read_guard_at,cooldown_armed" +
+          " FROM participants WHERE id=?1 AND key_hash=?2 AND revoked=0 AND key_epoch=?3",
       ).bind(who.id, who.key_hash, who.key_epoch).first<{
         last_read_id: number;
-        last_read_at: number | null;
+        read_guard_at: number | null;
         cooldown_armed: number;
       }>();
       if (!activity) throw new Refused("forbidden");
       const [, window] = LIMITS.read;
       const cooldownEnd =
-        !activity.cooldown_armed || activity.last_read_at === null
+        !activity.cooldown_armed || activity.read_guard_at === null
           ? 0
-          : activity.last_read_at + SPACE_LIMITS.assistant_read_seconds;
+          : activity.read_guard_at + cooldown;
       const retryAt = freshHumanId <= activity.last_read_id && cooldownEnd > now
         ? cooldownEnd
         : now - (now % window) + window;
@@ -451,13 +613,48 @@ export async function readWithTicket(
     }
     throw reason ?? e;
   }
-  const questions = (resultsByStatement[questionIndex]?.results ?? []) as QuestionState[];
+  const questions = context ? decorateQuestionStates(resultsByStatement[questionIndex]?.results ?? [], context) : [];
   const turns = ((resultsByStatement[turnIndex]?.results ?? []) as RelayTurn[]).map((turn) => ({
     ...turn,
     question: safeExcerpt(turn.question),
     preceding_reply: safeExcerpt(turn.preceding_reply),
   }));
-  return [page, more, ticket, questions, turns];
+  const generation = (resultsByStatement[activityIndex].results[0] as { ticket_generation: number } | undefined)?.ticket_generation;
+  const ticket = reusable
+    ? await reusableTicket(env.SOURCE_HASH_KEY!, { ...who, ticket_generation: generation ?? who.ticket_generation }, now)
+    : storedTicket;
+  return [page, more, ticket, questions, turns, next, previous];
+}
+
+function sendAdmission(env: Env, who: Participant, now: number, day: number, estimatedWrites: number) {
+  const guards = who.space_guard ? [who.space_guard] : [];
+
+  guards.push(requireSql(env.DB, "forbidden", STILL_VALID, who.id, who.key_hash, who.key_epoch));
+  const buckets = who.space_guard ? ["send"] : ["send", "send_day"];
+  for (const bucket of buckets) {
+    const [limit, window] = LIMITS[bucket];
+    guards.push(requireSql(env.DB, "rate_limited", dayCount + "<?", bucket, who.id, now - now % window, limit));
+  }
+  const updates = buckets.map(bucket => rateHit(env, bucket, who.id, now));
+  if (who.space_id) {
+    guards.push(requireSql(env.DB, "forbidden", "EXISTS(SELECT 1 FROM spaces WHERE id=? AND status='active')", who.space_id));
+    const scope = spaceLimit(env.DB, who.space_id, now, Boolean(who.space_guard), estimatedWrites,
+      STOP_MUTATIONS, spaceDailyWriteLimit(env.SPACE_DAILY_WRITE_LIMIT));
+    guards.push(...scope.guards);
+    updates.unshift(...scope.updates);
+  } else {
+    guards.push(budgetGuard(env.DB, day, STOP_MUTATIONS, estimatedWrites));
+    updates.unshift(addWriteEstimate(env.DB, day, estimatedWrites));
+  }
+  return { guards, updates };
+}
+
+async function refuseSendAttempt(env: Env, who: Participant, reason: Refused): Promise<never> {
+  // Valid credentials still spend a send attempt when the payload is rejected.
+  const now = nowSeconds();
+  const { guards, updates } = sendAdmission(env, who, now, now - (now % 86400), 8);
+  await env.DB.batch([...guards, ...updates]).catch(e => { throw refusal(e) ?? e; });
+  throw reason;
 }
 
 /** One D1 batch (a transaction): insert only if every rule holds, then consume the ticket only if the
@@ -469,24 +666,52 @@ export async function sendMessage(
   reply: unknown,
   ticket: string | null,
   requireTicket: boolean,
-  relayedFor: string | null = null,
+  relay: unknown = null,
+  upload?: () => Promise<ImageData> | ImageData,
 ): Promise<number> {
-  const body = cleanText(text);
-  if (who.space_id && new TextEncoder().encode(body).length > SPACE_LIMITS.message_bytes)
-    throw new Refused("text_too_long");
-  const replyTo = replyId(reply);
-  if (requireTicket && !ticket) throw new Refused("ticket_missing");
-  const targets = who.space_id && who.kind === "human" && replyTo === null && relayedFor === null
-    ? routeQuestion(body, (await env.DB.prepare(
-      "SELECT id,name,ai_type FROM participants WHERE room_id=? AND kind='assistant' AND revoked=0 ORDER BY created_at,rowid",
-    ).bind(who.room_id).all<{ id: string; name: string; ai_type: string | null }>()).results)
-    : [];
-  const route = targets.length ? JSON.stringify(targets) : null;
-  const digest = await sha256hex(body);
-  const ticketHash = ticket ? await sha256hex(ticket) : "";
+  if (await exhausted(env, "send", who.id) ||
+      (!who.space_guard && await exhausted(env, "send_day", who.id)))
+    throw new Refused("rate_limited");
+  let body: string;
+  let replyTo: number | null;
+  let relayedFor: string | null;
+  let targets: ReturnType<typeof routeQuestion>;
   const now = nowSeconds();
+  let reusable: boolean;
+  let image: ImageData | undefined;
+  try {
+    if (relay != null && !who.space_guard) throw new Refused("forbidden");
+    if (relay != null && typeof relay !== "string") throw new Refused("invalid");
+    relayedFor = relay ?? null;
+    if (upload) {
+      if (!imageUploadsOn(env.IMAGE_UPLOADS)) throw new Refused("image_disabled");
+      if (who.kind === "assistant" && who.delivery !== "header") throw new Refused("image_unsupported");
+      if (await exhausted(env, "image_upload", who.id)) throw new ImageLimit("participant_minute");
+      image = await upload();
+    }
+    body = image && (text == null || typeof text === "string" && !text.trim()) ? "" : cleanText(text);
+    if (who.space_id && new TextEncoder().encode(body).length > SPACE_LIMITS.message_bytes)
+      throw new Refused("text_too_long");
+    replyTo = replyId(reply);
+    if (requireTicket && !ticket) throw new Refused("ticket_missing");
+    reusable = ticket !== null && await verifyReusableTicket(env.SOURCE_HASH_KEY, who, ticket, now, TICKET_SECONDS);
+    targets = who.space_id && who.kind === "human" && replyTo === null && relayedFor === null
+      ? routeQuestion(body, (await env.DB.prepare(
+        "SELECT id,name,ai_type FROM participants WHERE room_id=? AND kind='assistant' AND revoked=0 ORDER BY created_at,rowid",
+      ).bind(who.room_id).all<{ id: string; name: string; ai_type: string | null }>()).results)
+      : [];
+  } catch (e) {
+    if (e instanceof ImageLimit) throw e;
+    if (e instanceof Refused) return refuseSendAttempt(env, who, e);
+    throw e;
+  }
+  const route = targets.length ? JSON.stringify(targets) : null;
+  const imageSha = image && await imageDigest(image.data);
+  // Two different displayed authors may legitimately share an attachment.
+  const digest = await sha256hex(imageSha ? "image:" + imageSha + "\0" + (relayedFor ?? "") + "\0" + body : body);
+  const ticketHash = ticket && !reusable ? await sha256hex(ticket) : "";
   const cutoff = retentionCutoff(who.retention_days, now);
-  const ticketRule = requireTicket
+  const ticketRule = requireTicket && !reusable
     ? " AND EXISTS (SELECT 1 FROM send_tickets WHERE ticket_hash = ?6 AND participant_id = ?2 AND created_at > ?7)"
     : "";
   const insert = env.DB.prepare(
@@ -497,7 +722,8 @@ export async function sendMessage(
       " ORDER BY id DESC LIMIT 1) WHERE body_hash = ?4)" +
       " AND NOT EXISTS (SELECT 1 FROM messages WHERE participant_id = ?2 AND body_hash = ?4 AND created_at > ?9)" +
       " AND (?8 IS NULL OR EXISTS (SELECT 1 FROM messages WHERE id = ?8 AND room_id = ?1 AND created_at > ?10))" +
-      " AND EXISTS (SELECT 1 FROM participants WHERE id = ?2 AND key_hash = ?11 AND revoked = 0 AND key_epoch = ?12)" +
+      " AND EXISTS (SELECT 1 FROM participants WHERE id = ?2 AND key_hash = ?11 AND revoked = 0 AND key_epoch = ?12" +
+      " AND (?15 IS NULL OR ticket_generation=?15))" +
       " RETURNING id",
   ).bind(
     who.room_id,
@@ -514,34 +740,39 @@ export async function sendMessage(
     who.key_epoch,
     relayedFor,
     route,
+    reusable ? who.ticket_generation : null,
   );
-  const statements = who.space_guard ? [who.space_guard] : [];
-  const day = dayStart();
+  const day = now - (now % 86400);
+  const sendCost = 28 + targets.length * 8 + (image ? IMAGE_WRITE_RESERVE : 0);
+  const attachment = image && imageBudget(env.DB, who.room_owner, who.id, image.data.length, now, imageUsageLimits(env));
+  const { guards: statements, updates } = sendAdmission(env, who, now, day, sendCost);
   if (who.space_id) {
-    statements.push(requireSql(env.DB, "forbidden", "EXISTS(SELECT 1 FROM spaces WHERE id=? AND status='active')", who.space_id));
     statements.push(retentionGuard(env.DB, who.space_id, who.retention_days, who.retention_rev));
-    statements.push(requireSql(env.DB, "quota", dayCount + "<?", "space_posts", who.space_id, day, SPACE_LIMITS.messages_per_day));
+    statements.push(env.DB.prepare("INSERT INTO space_post_assertion(failure) SELECT 'quota' WHERE " +
+      dayCount + ">=(SELECT daily_post_limit FROM spaces WHERE id=?)")
+      .bind("space_posts", who.space_id, day, who.space_id));
   }
   if (relayedFor !== null) {
-    if (!who.space_guard) throw new Refused("forbidden");
     statements.push(requireSql(env.DB, "not_found",
       "EXISTS(SELECT 1 FROM participants WHERE id=? AND room_id=? AND is_owner=0 AND revoked=0)", relayedFor, who.room_id));
   }
   if (route) {
     statements.push(requireSql(env.DB, "not_found",
-      "(SELECT count(*) FROM participants p JOIN json_each(?) target ON p.id=json_extract(target.value,'$.id')" +
-      " WHERE p.room_id=? AND p.kind='assistant' AND p.revoked=0)=?",
+      "(SELECT count(*) FROM participants p WHERE p.id IN (SELECT json_extract(value,'$.id') FROM json_each(?))" +
+      " AND p.room_id=? AND p.kind='assistant' AND p.revoked=0)=?",
       route, who.room_id, targets.length));
   }
+  statements.push(...(attachment?.checks ?? []), ...updates);
   const insertIndex = statements.length;
   statements.push(insert);
+  if (attachment && image) statements.push(saveImage(env.DB, who.room_id, who.room_owner, image, imageSha!, now), ...attachment.hits);
   if (requireTicket) {
     // changes() is the row count of the INSERT just above, inside the same transaction
     statements.push(
-      env.DB.prepare("DELETE FROM send_tickets WHERE ticket_hash = ? AND participant_id = ? AND changes() = 1").bind(
-        ticketHash,
-        who.id,
-      ),
+      reusable
+        ? env.DB.prepare("UPDATE participants SET ticket_generation=ticket_generation+1 WHERE id=? AND changes()=1").bind(who.id)
+        : env.DB.prepare("DELETE FROM send_tickets WHERE ticket_hash = ? AND participant_id = ? AND changes() = 1")
+          .bind(ticketHash, who.id),
     );
   }
   if (who.space_id) {
@@ -552,18 +783,31 @@ export async function sendMessage(
   }
   let result;
   try { result = await env.DB.batch<{ id: number }>(statements); }
-  catch (e) { throw refusal(e) ?? e; }
+  catch (e) {
+    if (who.space_id && String(e).includes("CHECK constraint failed: space_post_quota")) {
+      const limit = await env.DB.prepare("SELECT daily_post_limit FROM spaces WHERE id=?")
+        .bind(who.space_id).first<number>("daily_post_limit");
+      throw new DailyCapacity(now, "space_posts", limit ?? SPACE_LIMITS.messages_per_day);
+    }
+    const reason = imageLimit(e) ?? refusal(e);
+    if (reason?.code === "not_found") return refuseSendAttempt(env, who, reason);
+    throw reason ?? e;
+  }
   const row = result[insertIndex].results[0];
   // Sending does not move the sender's read position: unread messages from others stay unread (review P2).
   if (row) return row.id;
-  // Nothing was written; work out which rule refused it (read-only).
+  // Only the attempt counters changed. Work out which rule refused the message.
   const live = await env.DB.prepare(
     "SELECT 1 FROM participants WHERE id = ? AND key_hash = ? AND revoked = 0 AND key_epoch = ?",
   )
     .bind(who.id, who.key_hash, who.key_epoch)
     .first();
   if (!live) throw new Refused("forbidden");
-  if (requireTicket) {
+  if (reusable) {
+    const active = await env.DB.prepare("SELECT 1 FROM participants WHERE id=? AND ticket_generation=?")
+      .bind(who.id, who.ticket_generation).first();
+    if (!active) throw new Refused("ticket_invalid");
+  } else if (requireTicket) {
     const live = await env.DB.prepare(
       "SELECT 1 FROM send_tickets WHERE ticket_hash = ? AND participant_id = ? AND created_at > ?",
     )
@@ -582,7 +826,7 @@ export async function sendMessage(
 
 export function renderRead(
   who: Participant, messages: Message[], more: boolean, ticket: string,
-  questions: QuestionState[] = [], turns: RelayTurn[] = [],
+  questions: QuestionState[] = [], turns: RelayTurn[] = [], next?: number,
 ): string {
   // Body lines are indented by 4 spaces, so a body can never start a line that looks like a header ('#'),
   // a message ('[') or a separator; '&', '<' and '>' are HTML-escaped.
@@ -592,20 +836,24 @@ export function renderRead(
     `# 나: ${escapeHtml(who.name)} (${kindLabel(who.kind)})`,
     ...TRUST_NOTICE.map((line) => `# 주의: ${line}`),
     `# 지금: ${when(nowSeconds())} (서울)`,
-    `# 보내기 확인값: ${ticket} (${TICKET_SECONDS / 60}분 안에 한 번)`,
+    `# 보내기 확인값: ${ticket}`,
+    `# 쓰기 안내: 사용자가 답을 요청하면 같은 읽기 주소의 /read를 /send로 바꾸고, 방 열쇠 k를 유지한 채 c=확인값과 text=URL 인코딩한 본문을 붙이세요.`,
+    `# 확인값은 ${TICKET_SECONDS / 60}분 안에 한 번 쓰며, 방 열쇠와 확인값을 공유하지 마세요.`,
+    "# 이미지: 주소(GET) 방식으로는 직접 올릴 수 없습니다. 만든 이미지를 사용자에게 전달하면 사용자가 대신 올릴 수 있습니다.",
     `# 새 글: ${messages.length}개` + (more ? " (더 있음: 다시 읽으세요)" : ""),
   ];
   for (const q of questions.filter((q) => q.participant_id === who.id && q.reply_id === null)) {
     const label = q.awaiting_previous ? "앞 답변 대기 질문" : "나를 부른 질문";
     lines.push(`# ${label}: #${q.question_id}${q.step ? ` (순서 ${q.step})` : ""}`);
   }
-  if (messages.length) lines.push(`# 다음 since: ${messages[messages.length - 1].id}`);
+  if (next && (messages.length || more)) lines.push(`# 다음 since: ${next}`);
   lines.push("---");
   for (const m of messages) {
     const relay = m.relayed_for ? " [사용자가 대신 올림]" : "";
     const reply = m.reply_to ? ` (답장: ${m.reply_to})` : "";
     lines.push(`[${m.id}] ${when(m.created_at)} ${escapeHtml(m.sender)}(${kindLabel(m.sender_kind)})${relay}${reply}`);
-    for (const line of m.body.split("\n")) lines.push("    " + escapeHtml(line));
+    if (m.image) lines.push(`[이미지 #${m.id} ${m.image.mime} ${Math.ceil(m.image.bytes / 1000)}KB ${m.image.width}×${m.image.height}]`);
+    if (m.body) for (const line of m.body.split("\n")) lines.push("    " + escapeHtml(line));
   }
   for (const turn of turns) {
     lines.push(`# 이어서 답할 질문 #${turn.question_id} (답장 번호: ${turn.question_id})`);
@@ -626,23 +874,67 @@ export function sinceOf(url: URL): number | null {
   return Number(raw);
 }
 
+export function imageMessageId(value: string) {
+  const id = replyId(value);
+  if (id === null || !Number.isSafeInteger(id)) throw new Refused("not_found");
+  return id;
+}
+
+export async function uploadImage(
+  request: Request, env: Env, url: URL, who: Participant, relay: string | null = null,
+) {
+  const query = url.searchParams;
+  const mime = request.headers.get("content-type")?.toLowerCase();
+  const caption = request.headers.get("x-mailbox-text");
+  const { image_max_bytes: maximum, image_max_edge: maximumEdge } = imageUsageLimits(env);
+  const id = await sendMessage(env, who, caption === null ? query.get("text") : decodedCaption(caption),
+    query.get("reply_to"), null, false, relay, async () => inspectImage(mime, await readImageInput(request, imageInputLimit(maximum)), maximum, maximumEdge));
+  return json({ ok: true, id });
+}
+
+function decodedCaption(value: string) {
+  try { return decodeURIComponent(value); }
+  catch { throw new Refused("text_invalid"); }
+}
+
+async function participantImage(request: Request, env: Env, url: URL, room: string, messageId?: string) {
+  if (!messageId && request.method === "POST") {
+    if (url.searchParams.has("k")) throw new Refused("key_conflict");
+    const who = await authenticate(env, request, room, request.headers.get("x-mailbox-key"), "send");
+    return uploadImage(request, env, url, who);
+  }
+  if (messageId && request.method === "GET") {
+    const who = await authenticate(env, request, room, keyFrom(request, url), "read", true);
+    if (url.searchParams.has("k") && who.space_id && who.delivery !== "get") throw new Refused("forbidden");
+    await takeParticipantRead(env.DB, who.id, nowSeconds(), who.space_id,
+      spaceDailyWriteLimit(env.SPACE_DAILY_WRITE_LIMIT), 3);
+    const guards = [requireSql(env.DB, "forbidden", STILL_VALID + " AND " + EPOCH_NOT_LOWERED,
+      who.id, who.key_hash, who.key_epoch, who.key_epoch)];
+    if (who.space_id) guards.push(retentionGuard(env.DB, who.space_id, who.retention_days, who.retention_rev));
+    return loadImage(env.DB, guards, room, imageMessageId(messageId), retentionCutoff(who.retention_days, nowSeconds()));
+  }
+  throw new Refused("method_not_allowed");
+}
+
 // ---- participant routes -----------------------------------------------------------------------------
 async function participantRoute(request: Request, env: Env, url: URL, roomId: string, action: string) {
   const q = url.searchParams;
   if (action === "read" && request.method === "GET") {
     try {
-      const who = await authenticate(env, request, roomId, keyFrom(request, url), "read");
-      const [messages, more, ticket, questions, turns] = await readWithTicket(env, who, sinceOf(url));
-      return plain(renderRead(who, messages, more, ticket, questions, turns));
+      const who = await authenticate(env, request, roomId, keyFrom(request, url), "read", true);
+      const [messages, more, ticket, questions, turns, next] = await readWithTicket(env, who, sinceOf(url));
+      return plain(renderRead(who, messages, more, ticket, questions, turns, next));
     } catch (e) {
+      if (e instanceof DailyCapacity) throw e;
       if (e instanceof Refused) return e.retryAfter ? retry(e) : error(e.code, true);
       throw e;
     }
   }
   if (action === "messages" && request.method === "GET") {
     try {
-      const who = await authenticate(env, request, roomId, keyFrom(request, url), "read");
-      const [messages, more, ticket, questions, turns] = await readWithTicket(env, who, sinceOf(url));
+      const who = await authenticate(env, request, roomId, keyFrom(request, url), "read", true);
+      const [messages, more, ticket, questions, turns, next] = await readWithTicket(env, who, sinceOf(url),
+        !request.headers.has("x-mailbox-key"));
       return json({
         notice: TRUST_NOTICE.join(" "),
         room: { name: who.room_name },
@@ -655,23 +947,28 @@ async function participantRoute(request: Request, env: Env, url: URL, roomId: st
           created_at: m.created_at,
           reply_to: m.reply_to,
           relayed_for: m.relayed_for,
+          ...(m.image ? { image: m.image } : {}),
         })),
         more,
-        ticket,
+        next,
+        ...(ticket ? { ticket } : {}),
         questions,
         relay_turns: turns,
       });
     } catch (e) {
+      if (e instanceof DailyCapacity) throw e;
       if (e instanceof Refused) return e.retryAfter ? retry(e) : error(e.code, false);
       throw e;
     }
   }
   if (action === "send" && request.method === "GET") {
     try {
+      if (q.has("image_base64") || q.has("image_type")) throw new Refused("image_unsupported");
       const who = await authenticate(env, request, roomId, keyFrom(request, url), "send");
       const id = await sendMessage(env, who, q.get("text"), q.get("reply_to"), q.get("c"), true);
       return plain(`ok: ${id}\n`);
     } catch (e) {
+      if (e instanceof DailyCapacity) throw e;
       if (e instanceof Refused) return e.retryAfter ? retry(e) : error(e.code, true);
       throw e;
     }
@@ -679,11 +976,24 @@ async function participantRoute(request: Request, env: Env, url: URL, roomId: st
   if (action === "send" && request.method === "POST") {
     try {
       if (q.has("k")) throw new Refused("key_conflict");
-      const data = await readBody(request);
-      const who = await authenticate(env, request, roomId, keyFrom(request, url, data.k), "send");
-      const id = await sendMessage(env, who, data.text, data.reply_to, null, false);
+      const header = request.headers.has("x-mailbox-key");
+      const whoFromHeader = header
+        ? await authenticate(env, request, roomId, keyFrom(request, url), "send") : null;
+      const { image_max_bytes: maximum, image_max_edge: maximumEdge } = imageUsageLimits(env);
+      const canUpload = whoFromHeader && imageUploadsOn(env.IMAGE_UPLOADS) &&
+        (whoFromHeader.kind !== "assistant" || whoFromHeader.delivery === "header");
+      const data = await readBody(request, canUpload ? imageJsonLimit(maximum) : MAX_BODY);
+      const who = whoFromHeader ?? await authenticate(env, request, roomId, keyFrom(request, url, data.k), "send");
+      if (header && data.k != null) throw new Refused("key_conflict");
+      const image = Object.hasOwn(data, "image_base64") || Object.hasOwn(data, "image_type");
+      if (image && (!header || !/^application\/json(?:\s*;|$)/i.test(request.headers.get("content-type") ?? "")))
+        throw new Refused("image_unsupported");
+      const id = await sendMessage(env, who, data.text, data.reply_to, null, false, null,
+        image ? () => inspectImage(data.image_type, decodeImageBase64(data.image_base64, maximum), maximum, maximumEdge) : undefined);
       return json({ ok: true, id });
     } catch (e) {
+      if (e instanceof DailyCapacity || e instanceof ImageLimit ||
+          e instanceof Refused && (e.code === "image_too_large" || e.code === "image_dimensions")) throw e;
       if (e instanceof Refused) return e.retryAfter ? retry(e) : error(e.code, false);
       throw e;
     }
@@ -693,7 +1003,7 @@ async function participantRoute(request: Request, env: Env, url: URL, roomId: st
 }
 
 // ---- owner (방장) routes -------------------------------------------------------------------------------
-async function ownerOf(request: Request, env: Env): Promise<string> {
+async function ownerOf(request: Request, env: Env, ceiling = STOP_TRAFFIC): Promise<string> {
   // `<hash>` = default owner, `<owner-id>:<hash>` = named owner. Rooms belong to the owner id (review P1-1).
   const configured = (env.OWNER_KEY_SHA256 ?? "")
     .split(",")
@@ -705,19 +1015,27 @@ async function ownerOf(request: Request, env: Env): Promise<string> {
   const key = /^bearer\s+/i.test(auth) ? auth.replace(/^bearer\s+/i, "").trim() : ""; // header only, never query
   if (!key) throw new Refused("key_missing");
   const source = await sourceOf(request, env);
+  const now = nowSeconds();
+  const hash = await sha256hex(key);
+  const credential = "operator:" + hash;
+  rejectRecentlyDenied(env.DB, source, credential, now);
   if (await exhausted(env, "auth_fail", source)) throw new Refused("rate_limited");
-  const a = encoder.encode(await sha256hex(key));
+  const a = encoder.encode(hash);
   const match = configured.find((c) => {
     const b = encoder.encode(c.hash);
     return a.byteLength === b.byteLength && crypto.subtle.timingSafeEqual(a, b);
   });
   if (!match) {
-    if (!(await allow(env, "auth_fail", source))) throw new Refused("rate_limited");
+    if (!(await allow(env, "auth_fail", source))) {
+      rememberDenied(env.DB, source, credential, nowSeconds());
+      throw new Refused("rate_limited");
+    }
     throw new Refused("forbidden");
   }
   const owner = match.owner;
   if (await env.DB.prepare("SELECT 1 FROM spaces WHERE legacy_owner_id=?").bind(owner).first()) throw new Refused("forbidden");
-  if (!(await allow(env, "admin", owner))) throw new Refused("rate_limited");
+  if (!(await allow(env, "admin", owner, request.method === "GET" ? 6 : 48, ceiling)))
+    throw new Refused("rate_limited");
   return owner;
 }
 
@@ -753,7 +1071,8 @@ async function adminRoute(request: Request, env: Env, url: URL, parts: string[])
   try {
     if (isPreviewBot(request.headers)) throw new Refused("preview_refused");
     const data = request.method === "POST" ? await readBody(request) : {};
-    const owner = await ownerOf(request, env);
+    const revoking = parts.length === 6 && parts[5] === "revoke";
+    const owner = await ownerOf(request, env, request.method === "POST" && !revoking ? STOP_MUTATIONS : STOP_TRAFFIC);
     const base = env.PUBLIC_BASE_URL || url.origin;
     const atype = typeof data.assistant_type === "string" ? data.assistant_type : "";
     const now = nowSeconds();
@@ -770,13 +1089,18 @@ async function adminRoute(request: Request, env: Env, url: URL, parts: string[])
     const roomId = parts[2];
     if (parts.length === 4 && request.method === "GET") {
       await ownedRoom(env, owner, roomId);
+      const after = url.searchParams.get("after") ?? "";
+      if (after && !/^[\w-]{12}$/.test(after)) throw new Refused("invalid");
       const { results } = await env.DB.prepare(
         "SELECT id AS participant_id, name, kind, created_at, revoked FROM participants WHERE room_id = ?" +
-          " ORDER BY created_at, rowid",
+          " AND id>? ORDER BY id LIMIT ?",
       )
-        .bind(roomId)
+        .bind(roomId, after, MAX_ROOM_PARTICIPANTS + 1)
         .all<{ participant_id: string; name: string; kind: string; created_at: number; revoked: number }>();
-      return json({ participants: results.map((r) => ({ ...r, revoked: r.revoked === 1 })) });
+      const page = results.slice(0, MAX_ROOM_PARTICIPANTS);
+      const next = results.length > MAX_ROOM_PARTICIPANTS ? page.at(-1)!.participant_id : null;
+      return json({ participants: page.sort((a, b) => a.created_at - b.created_at)
+        .map((r) => ({ ...r, revoked: r.revoked === 1 })), next });
     }
     if (parts.length === 4 && request.method === "POST") {
       const roomName = await ownedRoom(env, owner, roomId);
@@ -793,11 +1117,13 @@ async function adminRoute(request: Request, env: Env, url: URL, parts: string[])
               " SELECT ?, ?, ?, ?, ?, ?, ? WHERE " +
               EPOCH_NOT_LOWERED + " RETURNING id",
           ).bind(pid, roomId, name, data.kind, await sha256hex(key), now, epoch, epoch),
+          requireSql(env.DB, "quota", "(SELECT count(*) FROM (SELECT 1 FROM participants WHERE room_id=? LIMIT ?))<=?",
+            roomId, MAX_ROOM_PARTICIPANTS + 1, MAX_ROOM_PARTICIPANTS),
           env.DB.prepare(RAISE_FLOOR).bind(epoch),
         ]);
       } catch (e) {
         if (String(e).includes("UNIQUE")) throw new Refused("name_taken");
-        throw e;
+        throw refusal(e) ?? e;
       }
       if (inserted.results.length !== 1) throw new Refused("key_epoch_invalid");
       return json(issued(base, roomId, roomName, pid, name, data.kind, key, atype));
@@ -832,72 +1158,102 @@ async function adminRoute(request: Request, env: Env, url: URL, parts: string[])
     }
     throw new Refused("not_found");
   } catch (e) {
+    if (e instanceof DailyCapacity) throw e;
     if (e instanceof Refused) return e.retryAfter ? retry(e) : error(e.code, false);
     throw e;
   }
 }
 
 // ---- retention -----------------------------------------------------------------------------------------
-export async function purge(env: Env): Promise<number> {
-  const now = nowSeconds();
-  const [removed] = await env.DB.batch([
-    env.DB.prepare(
-      "DELETE FROM messages WHERE created_at<=?1 AND created_at<=(" +
-        " SELECT CASE WHEN s.id IS NULL THEN ?2 ELSE ?3-s.retention_days*86400 END" +
-        " FROM rooms r LEFT JOIN spaces s ON s.id=r.owner_id WHERE r.id=messages.room_id)",
-    ).bind(now - 7 * SECONDS_PER_DAY, now - RETENTION_SECONDS, now),
-    env.DB.prepare(
-      "UPDATE messages SET reply_to = NULL WHERE reply_to IS NOT NULL AND reply_to NOT IN (SELECT id FROM messages)",
-    ),
-    env.DB.prepare("DELETE FROM send_tickets WHERE created_at <= ?").bind(now - TICKET_SECONDS),
-    env.DB.prepare("DELETE FROM rate_hits WHERE window_start <= ?").bind(now - 2 * 86400),
-    env.DB.prepare("DELETE FROM rate_hits WHERE bucket='auth_fail' AND window_start<?").bind(dayStart()),
-    env.DB.prepare("UPDATE spaces SET created_ip_hash=NULL WHERE created_ip_hash IS NOT NULL AND created_at<?").bind(dayStart()),
-  ]);
-  await env.DB.prepare("DELETE FROM spaces WHERE status='deleted' AND deleted_at<=?").bind(now - 86400).run();
-  return removed.meta.changes ?? 0;
+export function purge(env: Env): Promise<number> {
+  return maintain(env.DB, nowSeconds());
 }
 
 // ---- entry ---------------------------------------------------------------------------------------------
+async function handleRequest(request: Request, env: Env, url: URL): Promise<Response> {
+  const isApi = url.pathname.startsWith("/api/");
+  const parts = url.pathname.split("/").filter(Boolean);
+  const participantPath = parts.length === 3 && parts[0] === "r";
+  const imagePath = parts[0] === "r" && parts[2] === "image" && parts.length === 4;
+  const plainError = participantPath && request.method === "GET" && ["read", "send"].includes(parts[2]);
+  try {
+    if (request.url.length > MAX_URL) return isApi ? apiError(new Refused("invalid")) : error("url_too_long", true);
+    if (isApi || parts[0] === "admin" || participantPath || imagePath) {
+      const { estimate } = await recentCapacity(env.DB, nowSeconds());
+      if (estimate >= STOP_TRAFFIC) throw new DailyCapacity();
+      const mutation = request.method !== "GET" && request.method !== "HEAD" || participantPath && parts[2] === "send";
+      const credentialRepair = url.pathname === "/api/spaces/recover" ||
+        url.pathname.endsWith("/revoke") || url.pathname.endsWith("/revoke-all");
+      if (mutation && !credentialRepair) await requireCapacity(env.DB, STOP_MUTATIONS);
+    }
+    if (isApi) return await api(request, env, url);
+    if (url.pathname === "/healthz" && request.method === "GET") {
+      // the operator's check after a deploy, rollback or restore: a bad KEY_EPOCH is reported here
+      try {
+        await currentEpoch(env);
+      } catch (e) {
+        if (e instanceof Refused) return plain("config_error: KEY_EPOCH missing, invalid or lower than used\n", 503);
+        throw e;
+      }
+      return plain("ok\n");
+    }
+    if (participantPath || imagePath) {
+      let roomId: string;
+      try {
+        roomId = decodeURIComponent(parts[1]);
+      } catch {
+        return error("not_found", false);
+      }
+      if (parts[2] === "image") return await participantImage(request, env, url, roomId, parts[3]);
+      return await participantRoute(request, env, url, roomId, parts[2]);
+    }
+    if (parts[0] === "admin") return await adminRoute(request, env, url, parts);
+    if (env.ASSETS && ["GET", "HEAD"].includes(request.method)) return await serveAsset(request, env, url);
+    return error("not_found", false);
+  } catch (e) {
+    if (e instanceof DailyCapacity) {
+      refreshCapacityOnRefusal(env.DB, e);
+      return dailyCapacityResponse(e, plainError);
+    }
+    if (e instanceof ImageLimit) {
+      const response = json({ error: e.code, scope: e.scope, message: e.messageForUser, retry_after: e.retryAfter }, 429);
+      if (e.retryAfter) response.headers.set("retry-after", String(e.retryAfter));
+      return response;
+    }
+    const refused = refusal(e);
+    if (refused instanceof DailyCapacity) {
+      refreshCapacityOnRefusal(env.DB, refused);
+      return dailyCapacityResponse(refused, plainError);
+    }
+    if (/exceeded D1.s free tier daily row (?:read|write) limit|SQLITE_FULL/i.test(String(e))) {
+      return dailyCapacityResponse(new DailyCapacity(), plainError);
+    }
+    if (refused?.code === "image_too_large" || refused?.code === "image_dimensions") {
+      const { image_max_bytes, image_max_edge } = imageUsageLimits(env);
+      return json({ error: refused.code, image_max_bytes, image_max_edge }, 413);
+    }
+    if (isApi) return apiError(e);
+    if (parts[2] === "image" && refused) return refused.retryAfter ? retry(refused) : error(refused.code, false);
+    // never echo the exception or the request: either may contain a key
+    return error("internal", false);
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    const isApi = url.pathname.startsWith("/api/");
-    try {
-      if (request.url.length > MAX_URL) return isApi ? apiError(new Refused("invalid")) : error("url_too_long", true);
-      const parts = url.pathname.split("/").filter(Boolean);
-      const participantPath = parts.length === 3 && parts[0] === "r";
-      if (isApi || parts[0] === "admin" || (participantPath && ["read","messages","send"].includes(parts[2]))) {
-        await countRequest(env.DB, url.pathname, request.method);
-      }
-      if (isApi) return await api(request, env, url);
-      if (url.pathname === "/healthz" && request.method === "GET") {
-        // the operator's check after a deploy, rollback or restore: a bad KEY_EPOCH is reported here
-        try {
-          await currentEpoch(env);
-        } catch (e) {
-          if (e instanceof Refused) return plain("config_error: KEY_EPOCH missing, invalid or lower than used\n", 503);
-          throw e;
-        }
-        return plain("ok\n");
-      }
-      if (participantPath) {
-        let roomId: string;
-        try {
-          roomId = decodeURIComponent(parts[1]);
-        } catch {
-          return error("not_found", false);
-        }
-        return await participantRoute(request, env, url, roomId, parts[2]);
-      }
-      if (parts[0] === "admin") return await adminRoute(request, env, url, parts);
-      if (env.ASSETS && ["GET", "HEAD"].includes(request.method)) return await serveAsset(request, env, url);
-      return error("not_found", false);
-    } catch (e) {
-      if (isApi) return apiError(e);
-      // never echo the exception or the request: either may contain a key
-      return error("internal", false);
+    const secureOrigin = `https://${url.host}`;
+    const publicHost = env.PUBLIC_BASE_URL?.replace(/\/$/, "") === secureOrigin;
+    if (publicHost && url.protocol === "http:") {
+      if (request.method !== "GET" && request.method !== "HEAD") return plain("error: https_required\n", 403);
+      // The HTTPS location never contains the insecure request's query.
+      return new Response(null, {
+        status: 308, headers: { ...SECURITY_HEADERS, location: secureOrigin + url.pathname },
+      });
     }
+    const response = await handleRequest(request, env, url);
+    if (publicHost && url.protocol === "https:") response.headers.set("strict-transport-security", "max-age=15552000");
+    return response;
   },
 
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {

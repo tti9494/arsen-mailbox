@@ -17,6 +17,8 @@
     "migrations_dir": "migrations"
   }],
   "vars": {
+    // "PUBLIC_BASE_URL": "https://your-host.example", // 필수 설정입니다. HTTPS 강제와 HSTS에 쓰입니다.
+    // "IMAGE_UPLOADS": "off",
     "KEY_EPOCH": "0",
     "SIGNUP_OPEN": "invite",
     "TURNSTILE_SITEKEY": "REPLACE_WITH_YOUR_TURNSTILE_SITEKEY"
