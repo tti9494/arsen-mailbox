@@ -420,6 +420,8 @@ export async function authenticate(
     }
     throw new Refused("forbidden");
   }
+  if (new URL(request.url).searchParams.has("k") && who.space_id && who.delivery !== "get")
+    throw new Refused("forbidden");
   if (bucket === "read") {
     if (!deferRead) await takeParticipantRead(env.DB, who.id, nowSeconds(), who.space_id,
       spaceDailyWriteLimit(env.SPACE_DAILY_WRITE_LIMIT), readCost);
@@ -905,7 +907,6 @@ async function participantImage(request: Request, env: Env, url: URL, room: stri
   }
   if (messageId && request.method === "GET") {
     const who = await authenticate(env, request, room, keyFrom(request, url), "read", true);
-    if (url.searchParams.has("k") && who.space_id && who.delivery !== "get") throw new Refused("forbidden");
     await takeParticipantRead(env.DB, who.id, nowSeconds(), who.space_id,
       spaceDailyWriteLimit(env.SPACE_DAILY_WRITE_LIMIT), 3);
     const guards = [requireSql(env.DB, "forbidden", STILL_VALID + " AND " + EPOCH_NOT_LOWERED,

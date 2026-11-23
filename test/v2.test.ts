@@ -399,6 +399,44 @@ describe("rooms, participants and messages", () => {
     await ok(call(path, "DELETE", s.key));
     await denied(call(path + "/messages", "GET", a.key), 403, "forbidden");
   });
+  it("restricts space query keys to get-delivery participants across GET routes", async () => {
+    const s = await ok(signup());
+    const r = await room(s.key);
+    const root = `/r/${r.room_id}`;
+    const messages = `${root}/messages`;
+    const header = await member(r.room_id, s.key, "헤더 비서", "assistant", "header");
+
+    expect((await call(`${root}/read?k=${encodeURIComponent(header.key)}`)).status).toBe(403);
+    await denied(call(`${messages}?k=${encodeURIComponent(header.key)}`), 403, "forbidden");
+    expect((await call(`${root}/send?${new URLSearchParams({ k: header.key, text: "거절" })}`)).status).toBe(403);
+    await denied(call(`${messages}?k=${encodeURIComponent(header.key)}`, "GET", header.key), 403, "forbidden");
+    await denied(call(`${messages}?k=`, "GET", header.key), 403, "forbidden");
+
+    const headerRead = await call(`${root}/read`, "GET", header.key);
+    expect(headerRead.status).toBe(200);
+    const headerTicket = /^# 보내기 확인값: (amt_v2_[\w-]+)$/m.exec(await headerRead.text())?.[1];
+    expect(headerTicket).toBeTruthy();
+    expect((await call(messages, "GET", header.key)).status).toBe(200);
+    expect((await call(`${root}/send?${new URLSearchParams({ c: headerTicket!, text: "헤더 키로 전송" })}`,
+      "GET", header.key)).status).toBe(200);
+
+    const getRead = await member(r.room_id, s.key, "주소 읽기", "assistant", "get");
+    const read = await call(`${root}/read?k=${encodeURIComponent(getRead.key)}`);
+    expect(read.status).toBe(200);
+    expect(await read.text()).toContain("# 새 글:");
+
+    const getMessages = await member(r.room_id, s.key, "주소 API 읽기", "assistant", "get");
+    expect((await call(`${messages}?k=${encodeURIComponent(getMessages.key)}`)).status).toBe(200);
+
+    const getSend = await member(r.room_id, s.key, "주소 보내기", "assistant", "get");
+    const sendRead = await call(`${root}/read?k=${encodeURIComponent(getSend.key)}`);
+    expect(sendRead.status).toBe(200);
+    const sendTicket = /^# 보내기 확인값: (amt_v2_[\w-]+)$/m.exec(await sendRead.text())?.[1];
+    expect(sendTicket).toBeTruthy();
+    expect((await call(`${root}/send?${new URLSearchParams({
+      k: getSend.key, c: sendTicket!, text: "주소 키로 전송",
+    })}`)).status).toBe(200);
+  });
   it("reads a fresh human post immediately with the same assistant key and throttles empty or stale reads after first grace", async () => {
     const s = await ok(signup());
     const aRoom = await room(s.key);
@@ -800,6 +838,9 @@ describe("rooms, participants and messages", () => {
     const r = await ok(admin("/admin/rooms", { name: "기존 방" }));
     const p = await ok(admin("/admin/rooms/" + r.room_id + "/participants", { name: "공간 주인", kind: "assistant" }));
     const old = await ok(call("/r/" + r.room_id + "/send", "POST", p.key, { text: "보존할 글" }));
+    expect((await call(`/r/${r.room_id}/read?k=${encodeURIComponent(p.key)}`)).status).toBe(200);
+    await db.prepare("UPDATE participants SET last_read_id=0,last_read_at=NULL,first_read_at=NULL,read_guard_at=NULL," +
+      "cooldown_armed=0,read_minute=0,read_count=0 WHERE id=?").bind(p.participant_id).run();
     const key = newKey("ams_"),
       id = "migrated";
     await migrateOwnerRows(
@@ -1011,7 +1052,7 @@ describe("security review repairs", () => {
   it("counts bad address confirmations against the existing send and space counters", async () => {
     const s = await ok(signup());
     const r = await room(s.key);
-    const a = await member(r.room_id, s.key);
+    const a = await member(r.room_id, s.key, "비서", "assistant", "get");
     vi.spyOn(Date, "now").mockReturnValue(Math.floor(Date.now() / 60_000) * 60_000 + 5_000);
     const path = "/r/" + r.room_id + "/send?" + new URLSearchParams({
       k: a.key, c: "amt_v2_0_" + "A".repeat(43), text: "합성 글",
@@ -1146,7 +1187,7 @@ describe("security review repairs", () => {
 
     // The batch guard sees the new limit even while the isolate still has the earlier phase cached.
     await setEstimate(STOP_TRAFFIC);
-    await quota(await call("/r/" + r.room_id + "/read?k=" + a.key, "GET"), true);
+    await quota(await call("/r/" + r.room_id + "/read", "GET", a.key), true);
     expect(await state()).toEqual(before);
     expect(await db.prepare("SELECT count(*) AS n FROM messages WHERE room_id=?").bind(r.room_id).first("n")).toBe(1);
   });
@@ -1154,8 +1195,8 @@ describe("security review repairs", () => {
   it("reuses an address confirmation without storage and spends it once in a concurrent send", async () => {
     const s = await ok(signup());
     const r = await room(s.key);
-    const a = await member(r.room_id, s.key);
-    const b = await member(r.room_id, s.key, "다른 비서");
+    const a = await member(r.room_id, s.key, "비서", "assistant", "get");
+    const b = await member(r.room_id, s.key, "다른 비서", "assistant", "get");
     const path = "/r/" + r.room_id;
     const clock = Math.floor(Date.now() / 60_000) * 60_000 + 5_000;
     vi.spyOn(Date, "now").mockReturnValue(clock);
@@ -1568,7 +1609,7 @@ describe("v2.2 scoped conversations", () => {
     const s = await ok(signup());
     const r = await room(s.key);
     const header = await member(r.room_id, s.key, "헤더 비서");
-    const address = await member(r.room_id, s.key, "주소 비서");
+    const address = await member(r.room_id, s.key, "주소 비서", "assistant", "get");
     const clock = vi.spyOn(Date, "now");
     const now = dayStart() + 12 * 3600;
     clock.mockReturnValue(now * 1000);
