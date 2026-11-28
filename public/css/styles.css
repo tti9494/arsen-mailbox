@@ -775,6 +775,8 @@ label {
   display: flex;
   flex-wrap: wrap;
   gap: var(--sp-1) var(--sp-4);
+  /* gridlines: 링크의 8px 누름 여백만큼 당겨 마지막 글자가 카드·머리말 오른쪽 선에 닿게 함 */
+  margin-right: calc(-1 * var(--sp-2));
 }
 
 .key-box {
@@ -2080,4 +2082,105 @@ label:not(.check-row) {
   max-width: 100%;
   max-height: calc(100dvh - 120px);
   object-fit: contain;
+}
+
+/* ── 첫 화면 그림: Stageshow(MIT, Benji Taylor) 구도 ──
+   모서리 bleed: 창은 위·왼쪽에서 한 간격(gutter) 들어오고 오른쪽·아래로 무대 밖까지 이어진다.
+   잘리는 건 빈 여백과 자리 표시 막대뿐, 실제 글자는 모두 무대 안에 온전히 둔다. */
+.hero-illustration {
+  padding: 0;
+  display: block;
+  overflow: hidden;
+  position: relative;
+  --hs-gutter: 28px;
+  --hs-bleed: 72px;
+}
+.hs-stage {
+  position: relative;
+  height: 312px;
+}
+.hs-window {
+  position: absolute;
+  top: var(--hs-gutter);
+  left: var(--hs-gutter);
+  right: calc(-1 * var(--hs-bleed));
+  bottom: calc(-1 * var(--hs-bleed));
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow), 0 14px 32px -18px rgba(35, 34, 31, 0.32);
+  overflow: hidden;
+}
+.hs-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--line);
+}
+.hs-room {
+  font-size: var(--fs-15);
+  font-weight: 700;
+  color: var(--text);
+}
+.hs-count {
+  font-size: var(--fs-12);
+  color: var(--muted);
+}
+.hs-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4) calc(var(--hs-bleed) + var(--hs-gutter)) var(--sp-4) var(--sp-4);
+}
+.hs-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+.hs-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.hs-col .sender-name {
+  font-size: var(--fs-12);
+  line-height: var(--lh-snug);
+  margin-left: var(--sp-1);
+}
+.hs-row .msg-bubble {
+  word-break: keep-all;
+}
+.hs-mine {
+  justify-content: flex-end;
+}
+.hs-mine .msg-bubble {
+  background: var(--accent-soft);
+  border-color: transparent;
+  border-top-left-radius: var(--radius-lg);
+  border-top-right-radius: var(--sp-1);
+}
+.hs-filler {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding-block: var(--sp-3);
+}
+.hs-bar {
+  display: block;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--line-strong);
+}
+.hs-bar-name { width: 44px; height: 6px; margin: 5px 0 6px var(--sp-1); background: var(--line); }
+.hs-bar-a { width: 168px; }
+.hs-bar-b { width: 112px; }
+
+@media (max-width: 559px) {
+  .hero-illustration { --hs-gutter: 20px; --hs-bleed: 56px; }
+  .hs-stage { height: 256px; }
+  .hs-row .msg-bubble { font-size: var(--fs-14, 14px); }
+  .hs-body > .hs-row:nth-child(3) { display: none; }
 }

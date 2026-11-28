@@ -2,8 +2,25 @@
 
 공식 서비스의 변경 내용을 최신순으로 기록합니다. 날짜는 한국 시간(KST) 기준입니다.
 
+
+## 2026-11-28 — 시트가 열릴 때 자리 잡기 (eunho-fx-plus)
+
+- 무엇: 참가자 넣기·상세·방 수정 같은 시트가 열릴 때 바탕은 스며들고 창은 0.94→1.02→1로 살짝 넘쳤다가 자리 잡는다(EasyUI SettleModal). 시트 내용·보안 수칙 로직은 그대로.
+- 출처: EasyUI(MIT © 2026 Suraj Maurya)·Morphin UI(MIT © 2026 Ivan Oliinyk)의 동작을 React 없이 새로 쓴 `eunho-fx-plus` 1.1. CSP(script-src 'self') 때문에 `public/js/eunho-fx-plus.js` 별도 파일, 라이선스 `public/js/eunho-fx-plus-LICENSE.txt`.
+- 관련 파일: `public/index.html`, `public/js/fx-init.js`, `public/js/eunho-fx-plus.js`, `public/js/eunho-fx-plus-LICENSE.txt`, `CHANGELOG.md`
+- 작업자: Grok Bot (백업: `C:\Users\phlog\ai-audit\backups\20261128-1856-round3\arsen-mailbox-eunho-fx\`)
+
+## 2026-11-26 — eunho-fx 로고 금속광·주 단추 빛 제거
+
+- 무엇: 라이트 모드에서 '아르센' 글자를 씻겨 보이게 하던 로고 금속광과, 짙은 청록 단추 위에서 보이지 않던 '+ 내 공간 만들기' 둘레 빛을 뺐다. 테마 분할 단추 Gooey, 자석·커서 빛, 불러오는 중 구슬, 새 글 현상은 그대로 둔다.
+- 관련 파일: \public/js/fx-init.js\, \CHANGELOG.md- 왜: 은호당님 점검 승인. 보이지 않거나 레이아웃·가독성을 해치는 효과만 걷어 내고, 맥락에 맞는 것은 그대로 둔다.
+- 작업자: Grok Bot (백업: \C:\\Users\\phlog\\ai-audit\\backups\\20261126-0406-fx-cleanup\\\)
+
 ## 다음 판본에 들어갈 것
 
+- 첫 화면 그림을 실제 방 화면처럼 다시 그렸습니다: 내 글에 클로드와 챗GPT가 이어서 답하는 모습이 실제 글자로 보이고, 화면이 그림 가장자리 밖으로 이어집니다. (Stageshow 구도 규칙, MIT · Benji Taylor)
+- 도움말 페이지 이름에도 같은 빛 스침을 더했고, 테마 고르기 단추에도 선택 표시가 따라옵니다.
+- 첫 화면 주 단추 둘레의 은은한 빛, 분할 단추의 끈적한 선택 표시, 새 글이 현상되듯 나타나는 효과, 이전 글 불러오는 중 표시를 더했습니다. 기기에서 '동작 줄이기'를 켜면 움직이지 않습니다.
 - 접힌 긴 글은 **전체보기**에서 끝까지 읽고 복사할 수 있습니다. (#2)
 - 방 안의 비서를 한꺼번에 부를 때 `비서들` 또는 `출첵`을 쓸 수 있습니다. (#8)
 - 로컬 설치와 검증에 쓰는 개발 도구의 판본을 정리했습니다. (#9)

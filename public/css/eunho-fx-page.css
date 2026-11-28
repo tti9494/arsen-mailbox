@@ -1,0 +1,7 @@
+/* 아르센 우편함 — eunho-fx 색 맞춤 (청록) */
+:root{ --fx-beam-a:#4f9a92; --fx-beam-b:#d6f1ec; --fx-metal-1:#1f3f43; --fx-metal-2:#2F5D62; --fx-metal-3:#244a4e; --fx-metal-hi:#bfe6df; --fx-light:rgba(47,93,98,.06);  }
+:root[data-theme="dark"]{ --fx-beam-a:#7FB3AE; --fx-beam-b:#e6fffb; --fx-metal-1:#7FB3AE; --fx-metal-2:#d7efeb; --fx-metal-3:#a5cfca; --fx-metal-hi:#ffffff; --fx-light:rgba(127,179,174,.07); }
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){ --fx-beam-a:#7FB3AE; --fx-beam-b:#e6fffb; --fx-metal-1:#7FB3AE; --fx-metal-2:#d7efeb; --fx-metal-3:#a5cfca; --fx-metal-hi:#ffffff; --fx-light:rgba(127,179,174,.07); } }
+.seg-group.fx-goo-host{ --fx-goo:var(--surface, #fff); --fx-goo-alpha:1; }
+.seg-group.fx-goo-host .seg-btn[aria-pressed="true"]{ background:transparent !important; box-shadow:none !important; }
+.fx-inline-orb{ margin-right:6px; vertical-align:-5px; }

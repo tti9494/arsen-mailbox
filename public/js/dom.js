@@ -186,35 +186,56 @@ export function icon(name, extraClass = "") {
 
 /** 화면 1 소개 그림: 방 안의 말풍선과 AI 아이콘 3개 */
 export function buildHeroIllustration() {
-  return svgEl(
-    "svg",
-    { viewBox: "0 0 420 200", role: "img", "aria-label": "한 방 안에서 사람과 세 AI 비서가 말풍선으로 대화하는 그림" },
-    // 바깥 방 윤곽
-    svgEl("rect", { x: 12, y: 12, width: 396, height: 176, rx: 16, fill: "var(--surface)", stroke: "var(--line-strong)", "stroke-width": "1.75" }),
-    // 상단 방 표시줄
-    svgEl("line", { x1: 12, y1: 44, x2: 408, y2: 44, stroke: "var(--line)", "stroke-width": "1.5" }),
-    svgEl("circle", { cx: 32, cy: 28, r: 5, fill: "var(--accent)" }),
-    svgEl("rect", { x: 46, y: 23, width: 82, height: 10, rx: 5, fill: "var(--line-strong)" }),
-    // 왼쪽 AI 비서 아이콘 3개 (클로드 · 챗GPT · 제미나이 색 토큰)
-    svgEl("circle", { cx: 46, cy: 76, r: 16, fill: "var(--kind-claude)" }),
-    svgEl("text", { x: 46, y: 81, "text-anchor": "middle", fill: "var(--avatar-ink)", "font-size": "12", "font-weight": "700" }, "클"),
-    svgEl("rect", { x: 72, y: 60, width: 176, height: 32, rx: 10, fill: "var(--bg)", stroke: "var(--line-strong)", "stroke-width": "1.5" }),
-    svgEl("rect", { x: 86, y: 72, width: 132, height: 8, rx: 4, fill: "var(--muted)" }),
-
-    svgEl("circle", { cx: 46, cy: 118, r: 16, fill: "var(--kind-chatgpt)" }),
-    svgEl("text", { x: 46, y: 123, "text-anchor": "middle", fill: "var(--avatar-ink)", "font-size": "12", "font-weight": "700" }, "챗"),
-    svgEl("rect", { x: 72, y: 102, width: 152, height: 32, rx: 10, fill: "var(--bg)", stroke: "var(--line-strong)", "stroke-width": "1.5" }),
-    svgEl("rect", { x: 86, y: 114, width: 110, height: 8, rx: 4, fill: "var(--muted)" }),
-
-    svgEl("circle", { cx: 46, cy: 160, r: 16, fill: "var(--kind-gemini)" }),
-    svgEl("text", { x: 46, y: 165, "text-anchor": "middle", fill: "var(--avatar-ink)", "font-size": "12", "font-weight": "700" }, "제"),
-    svgEl("rect", { x: 72, y: 144, width: 164, height: 32, rx: 10, fill: "var(--bg)", stroke: "var(--line-strong)", "stroke-width": "1.5" }),
-    svgEl("rect", { x: 86, y: 156, width: 120, height: 8, rx: 4, fill: "var(--muted)" }),
-
-    // 오른쪽 내 말풍선
-    svgEl("rect", { x: 248, y: 96, width: 140, height: 44, rx: 12, fill: "var(--accent-soft)", stroke: "var(--accent)", "stroke-width": "1.75" }),
-    svgEl("rect", { x: 264, y: 110, width: 106, height: 7, rx: 3.5, fill: "var(--accent)" }),
-    svgEl("rect", { x: 284, y: 123, width: 70, height: 7, rx: 3.5, fill: "var(--accent)" }),
+  // Stageshow(MIT, Benji Taylor) 규칙으로 다시 그린 첫 화면 그림: 판(접시) 위에 떠 있는 상자 대신
+  // 실제 방 화면의 일부를 오른쪽·아래로 잘라 보이게 하고, 이야기의 주인공(내 글과 AI의 답)만 실제 글자로 둔다.
+  const row = (kind, name, bubble) =>
+    el(
+      "div",
+      { className: "hs-row" },
+      buildAvatar(name, kind),
+      el(
+        "div",
+        { className: "hs-col" },
+        el("span", { className: "sender-name", dataset: { kind }, text: name }),
+        bubble,
+      ),
+    );
+  const filler = el(
+    "div",
+    { className: "msg-bubble hs-filler" },
+    el("span", { className: "hs-bar hs-bar-a" }),
+    el("span", { className: "hs-bar hs-bar-b" }),
+  );
+  return el(
+    "div",
+    { className: "hs-stage", role: "img", "aria-label": "한 방에서 내가 쓴 글에 클로드와 챗GPT가 이어서 답하는 화면 그림" },
+    el(
+      "div",
+      { className: "hs-window", "aria-hidden": "true" },
+      el(
+        "div",
+        { className: "hs-head" },
+        el("span", { className: "hs-room", text: "우리 집" }),
+        el("span", { className: "hs-count", text: "사람 1 · AI 3" }),
+      ),
+      el(
+        "div",
+        { className: "hs-body" },
+        el(
+          "div",
+          { className: "hs-row hs-mine" },
+          el("div", { className: "msg-bubble", text: "이번 주 장보기, 나눠서 적어 줄래?" }),
+        ),
+        row("claude", "클로드", el("div", { className: "msg-bubble", text: "채소와 과일은 제가 맡을게요." })),
+        row("chatgpt", "챗GPT", el("div", { className: "msg-bubble", text: "생필품은 이어서 적었어요." })),
+        el(
+          "div",
+          { className: "hs-row hs-row-filler" },
+          buildAvatar("제미나이", "gemini"),
+          el("div", { className: "hs-col" }, el("span", { className: "hs-bar hs-bar-name" }), filler),
+        ),
+      ),
+    ),
   );
 }
 
